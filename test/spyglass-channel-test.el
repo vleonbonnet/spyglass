@@ -136,6 +136,29 @@ The channel \"test\" is registered meanwhile, its messages going to
         (should (equal (sort (mapcar (lambda (r) (plist-get (cdr r) :s)) received) #'string<)
                        (list a b)))))))
 
+(ert-deftest spyglass-channel-paced-streams ()
+  "Channels keep their order, window and answers on paced streams too.
+Streams both of whose ends' writes block, as Emacs's sockets on
+Windows, are paced: these tests run so on any system, and with the
+default chunks and window, larger than a paced stream's window."
+  (let ((spyglass--pace-streams t))
+    (dolist (test '(spyglass-channel-chunks-in-order
+                    spyglass-channel-chunks-both-ways-at-once
+                    spyglass-channel-requests
+                    spyglass-channel-messages-both-ways))
+      (ert-info ((symbol-name test))
+        (funcall (ert-test-body (ert-get-test test)))))
+    (spyglass-channel-test--with (client server)
+      (let ((a (make-string (* 3 1024 1024) ?a))
+            (b (make-string (* 3 1024 1024) ?b)))
+        (should (spyglass--pace-interval
+                 (process-get (spyglass-connection-process client) 'spyglass-pace)))
+        (should (spyglass-channel-send client "test" (list :s a)))
+        (should (spyglass-channel-send server "test" (list :s b)))
+        (let ((received (spyglass-channel-test--wait-messages 2)))
+          (should (equal (sort (mapcar (lambda (r) (plist-get (cdr r) :s)) received) #'string<)
+                         (list a b))))))))
+
 (ert-deftest spyglass-channel-requests ()
   "Requests are answered, refused, failed, timed out, and fail without a channel."
   (spyglass-channel-test--with (client _server)

@@ -72,9 +72,20 @@
         (spyglass-test-converge (current-buffer) mirror)
         (should (equal (with-current-buffer mirror (buffer-string)) (buffer-string)))))))
 
+(defun spyglass-e2e--urandom-p ()
+  "Return non-nil when `head' reads random bytes from /dev/urandom.
+It reads the path itself, as MSYS2's on Windows, where Emacs does not
+see /dev."
+  (and (executable-find "head")
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (let ((coding-system-for-read 'binary))
+           (call-process "head" nil t nil "-c" "16" "/dev/urandom"))
+         (= (buffer-size) 16))))
+
 (ert-deftest spyglass-e2e-random-bytes ()
   "Random bytes from a process, raw bytes among them, arrive exactly."
-  (skip-unless (and (file-readable-p "/dev/urandom") (executable-find "head")))
+  (skip-unless (spyglass-e2e--urandom-p))
   (spyglass-test-with-connection connection
     (spyglass-e2e--with-buffer "urandom"
       (let* ((buffer (current-buffer))

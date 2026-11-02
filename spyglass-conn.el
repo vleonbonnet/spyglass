@@ -33,6 +33,9 @@
 ;; `close', `ack', `in', `fl', `sz' to it; `u', `closed' from it),
 ;; heartbeats (`ping'/`pong', which also estimate the clock offset) and
 ;; `bye'.  An optional message goes only to peers that announced it.
+;; A stream both of whose ends' writes block, as Emacs's sockets on
+;; Windows, is paced: acknowledgments of what was read (`rd') and frames
+;; in fragments (`fr') keep what neither end has read within a window.
 ;; Handlers for message types are registered in `spyglass--handlers'
 ;; by the owner, mirror, window and channel modules.
 ;;
@@ -72,6 +75,24 @@ this sends without reading, and its stream is dropped.  Keep it above
 `spyglass-window': resuming may queue that much."
   :group 'spyglass
   :type 'natnum)
+
+(defcustom spyglass-pace-window (* 64 1024)
+  "Bytes written on a paced stream and not yet read by the peer, at most.
+Emacs on Windows writes to sockets without reading meanwhile: a write
+the system cannot buffer waits until the peer reads, running no timer
+nor filter.  Two such ends writing to each other, as two Emacs on one
+Windows host, or one Emacs talking to itself, would each wait for the
+other forever.  A stream both of whose ends write so is paced: frames
+go in fragments of a quarter of this, and the peer acknowledges what
+it read.  Keep it well below what the system buffers between two
+sockets of one host, about 190 KB on Windows 11.  A stream takes the
+value it has when the stream is made."
+  :group 'spyglass
+  :type 'natnum)
+
+(defvar spyglass--pace-streams nil
+  "Non-nil makes every stream made meanwhile write as on Windows, paced.
+For tests: pacing is otherwise for streams whose writes block.")
 
 (defcustom spyglass-handshake-timeout 20.0
   "Seconds a new stream may take to complete the handshake."
@@ -340,23 +361,29 @@ updates and channels, rather wait while `spyglass--writing-p'."
   "Write FRAME, SIZE bytes, on PROCESS, CONNECTION's stream; then its queue.
 Return SIZE once FRAME is written, or nil when its write failed,
 reported unless QUIET.  Frames queued meanwhile are written after it.
-A failed write may have left part of a frame on the stream, which no
-later frame can follow: the stream is dropped, with what was queued,
-and comes back as after any failure, unless the connection is being
-closed."
+FRAME nil writes only the acknowledgment a paced stream owes, and what
+is queued meanwhile.  A failed write may have left part of a frame on
+the stream, which no later frame can follow: the stream is dropped,
+with what was queued, and comes back as after any failure, unless the
+connection is being closed."
   (let ((writer (spyglass--make-queue))
+        (pace (process-get process 'spyglass-pace))
         (written nil))
     (process-put process 'spyglass-writer writer)
     (unwind-protect
         (condition-case err
             (let ((next frame))
+              (spyglass--pace-ack process pace)
+              (unless next
+                (setq next (spyglass--queue-pop writer)))
               (while next
-                (if (stringp next)
-                    (process-send-string process next)
-                  (dolist (part next)
-                    (process-send-string process part)))
+                (if (and pace (spyglass--pace-interval pace))
+                    (spyglass--pace-frame connection process pace next)
+                  (dolist (part (if (stringp next) (list next) next))
+                    (spyglass--put process pace part)))
                 (setf (spyglass-connection-last-send connection) (float-time))
                 (unless written (setq written size))
+                (spyglass--pace-ack process pace)
                 (setq next (spyglass--queue-pop writer))))
           (error
            ;; A stream deleted on purpose meanwhile fails quietly.
@@ -367,6 +394,187 @@ closed."
                (spyglass--drop connection)))))
       (process-put process 'spyglass-writer nil))
     written))
+
+;;;; Paced streams
+
+;; Emacs on Windows makes every write to a socket block (`sys_write' in
+;; w32.c): a write the system cannot buffer waits until the peer reads,
+;; and Emacs runs no timer nor filter meanwhile, where elsewhere it
+;; reads while it waits.  When both ends of a stream write so, each may
+;; wait for the other to read, forever.  Such a stream is paced: each
+;; end keeps the bytes it wrote and its peer has not read below
+;; `spyglass-pace-window', waiting for the peer's acknowledgments
+;; (`rd') with timers and filters running, as Emacs waits elsewhere;
+;; frames larger than a quarter of it go in fragments (`fr'), between
+;; which the acknowledgments the writer owes go too.  Both ends announce
+;; in their hello that their writes block (`:pace', with how often to be
+;; acknowledged); a stream is paced when both did, and neither end
+;; pays for it otherwise.
+
+(cl-defstruct (spyglass--pace (:constructor spyglass--make-pace)
+                              (:copier nil))
+  "What a stream counts of the bytes it carries, and its pacing."
+  (written 0 :documentation "Bytes written.")
+  (read 0 :documentation "Bytes read.")
+  (acked 0 :documentation "Bytes written that the peer said it read.")
+  (reported 0 :documentation "Bytes read that the peer was told of.")
+  (window nil :documentation "Bytes written and not read, at most, when paced.")
+  (interval nil :documentation "Bytes read after which to tell the peer, once paced.")
+  (fragments nil :documentation "Reader of the frames arriving in fragments."))
+
+(defun spyglass--writes-block-p (process)
+  "Return non-nil when writing to PROCESS waits without reading.
+So Emacs writes to sockets on Windows."
+  (or spyglass--pace-streams
+      (and (eq system-type 'windows-nt)
+           (eq (process-type process) 'network))))
+
+(defun spyglass--put (process pace string)
+  "Write STRING, part of a frame, on PROCESS, counting it in PACE."
+  (process-send-string process string)
+  (when pace
+    (cl-incf (spyglass--pace-written pace) (length string))))
+
+(defun spyglass--pace-ack (process pace)
+  "Tell PROCESS's peer what was read, when due on its paced stream PACE.
+Only between frames, by the writer of PROCESS."
+  (let ((interval (and pace (spyglass--pace-interval pace))))
+    (when (and interval
+               (>= (- (spyglass--pace-read pace) (spyglass--pace-reported pace)) interval))
+      (setf (spyglass--pace-reported pace) (spyglass--pace-read pace))
+      (spyglass--put process pace
+                     (spyglass-wire-frame (list :t "rd" :n (spyglass--pace-read pace)))))))
+
+(defun spyglass--pace-acknowledge (connection process)
+  "Tell the peer what was read on PROCESS, CONNECTION's paced stream, if due.
+When a frame is being written, the writer tells it between frames,
+unless it waits for the peer to read, between frames too."
+  (let ((pace (process-get process 'spyglass-pace)))
+    (when (and pace (spyglass--pace-interval pace))
+      (cond
+       ((not (process-get process 'spyglass-writer))
+        (spyglass--write connection process nil 0 nil))
+       ((process-get process 'spyglass-pace-waiting)
+        ;; Not again while this write waits, if it does.
+        (process-put process 'spyglass-pace-waiting nil)
+        (unwind-protect
+            (spyglass--pace-ack process pace)
+          (process-put process 'spyglass-pace-waiting t)))))))
+
+(defun spyglass--pace-wait (connection process pace size)
+  "Wait until PROCESS, CONNECTION's paced stream PACE, may take SIZE bytes more.
+Timers and filters run meanwhile, as when Emacs waits to write
+elsewhere.  Signal an error when the stream ends first."
+  (spyglass--pace-ack process pace)
+  (while (let ((unread (- (spyglass--pace-written pace) (spyglass--pace-acked pace))))
+           (and (> unread 0) (> (+ unread size) (spyglass--pace-window pace))))
+    (unless (and (process-live-p process)
+                 (eq process (spyglass-connection-process connection)))
+      (error "The stream ended"))
+    (process-put process 'spyglass-pace-waiting t)
+    (unwind-protect
+        ;; Waiting on PROCESS returns as soon as it reads, the
+        ;; acknowledgment perhaps; waiting on no process would wait the
+        ;; whole timeout.  Other processes are read meanwhile.
+        (accept-process-output process 0.05)
+      (process-put process 'spyglass-pace-waiting nil))
+    (spyglass--pace-ack process pace)))
+
+(defun spyglass--pace-frame (connection process pace frame)
+  "Write FRAME, a string or a list of them, on PROCESS, CONNECTION's paced stream.
+PACE is its pacing.  A frame larger than a quarter of the window goes
+in fragments."
+  (let* ((parts (if (stringp frame) (list frame) frame))
+         (size (apply #'+ (mapcar #'length parts)))
+         (piece (/ (spyglass--pace-window pace) 4)))
+    (if (<= size piece)
+        (progn
+          (spyglass--pace-wait connection process pace size)
+          (dolist (part parts)
+            (spyglass--put process pace part)))
+      (let ((pending nil) (filled 0))
+        (cl-flet ((emit ()
+                    (let ((fragment (spyglass-wire-frame
+                                     '(:t "fr") (apply #'concat (nreverse pending)))))
+                      (setq pending nil filled 0)
+                      (spyglass--pace-wait connection process pace (length fragment))
+                      (spyglass--put process pace fragment))))
+          (dolist (part parts)
+            (let ((start 0) (end (length part)))
+              (while (< start end)
+                (let ((take (min (- end start) (- piece filled))))
+                  (push (substring part start (+ start take)) pending)
+                  (setq filled (+ filled take)
+                        start (+ start take))
+                  (when (= filled piece)
+                    (emit))))))
+          (when pending
+            (emit)))))))
+
+(defun spyglass--pace-start (connection header)
+  "Pace CONNECTION's stream if both ends' writes block.
+HEADER is the peer's hello, which says whether its writes block."
+  (let* ((process (spyglass-connection-process connection))
+         (pace (process-get process 'spyglass-pace))
+         (interval (plist-get header :pace)))
+    (when (and pace (natnump interval)
+               (spyglass-connection-capable-p connection "pc")
+               (spyglass--writes-block-p process))
+      ;; How often the peer asks to be told: within reason.
+      (setf (spyglass--pace-interval pace)
+            (min (max interval 1024) spyglass-max-frame-size)))))
+
+(defun spyglass--pace-receive (connection header payload)
+  "Handle HEADER and PAYLOAD from CONNECTION's peer if they pace the stream.
+Return non-nil when they did: an acknowledgment, or a fragment, whose
+frames, once whole, are handled in their turn."
+  (let* ((type (plist-get header :t))
+         (process (spyglass-connection-process connection))
+         (pace (and process (process-get process 'spyglass-pace))))
+    (cond
+     ((not (and pace (member type '("rd" "fr")))) nil)
+     ((equal type "rd")
+      (spyglass--pace-read-by-peer pace (plist-get header :n))
+      t)
+     (t
+      (let ((frames
+             (condition-case err
+                 (spyglass-wire-feed (or (spyglass--pace-fragments pace)
+                                         (setf (spyglass--pace-fragments pace)
+                                               (spyglass-wire-make-reader)))
+                                     (or payload "") spyglass-max-frame-size)
+               (spyglass-wire-error
+                (spyglass--report connection "Protocol error: %s" (cadr err))
+                (spyglass--drop connection)
+                nil))))
+        (dolist (frame frames)
+          (when (eq process (spyglass-connection-process connection))
+            (if (equal (plist-get (car frame) :t) "fr")
+                (progn
+                  (spyglass--report connection "Protocol error: a fragment within a fragment")
+                  (spyglass--drop connection))
+              (spyglass--guard connection
+                (spyglass--dispatch connection (car frame) (cdr frame)))))))
+      t))))
+
+(defun spyglass--pace-read-by-peer (pace n)
+  "Note that the peer of the stream PACE paces read N bytes of it."
+  (when (natnump n)
+    (setf (spyglass--pace-acked pace)
+          (max (spyglass--pace-acked pace) (min n (spyglass--pace-written pace))))))
+
+(defun spyglass--pace-take-acks (process frames)
+  "Apply the acknowledgments among FRAMES, read on PROCESS; return the others.
+They are applied as soon as read, never queued behind other frames: a
+write waiting for them may be what those frames wait for."
+  (let ((pace (process-get process 'spyglass-pace)))
+    (if (not (and pace (spyglass--pace-interval pace)))
+        frames
+      (cl-remove-if (lambda (frame)
+                      (when (equal (plist-get (car frame) :t) "rd")
+                        (spyglass--pace-read-by-peer pace (plist-get (car frame) :n))
+                        t))
+                    frames))))
 
 (defun spyglass--request (connection op callback &rest args)
   "Send request OP with ARGS, a plist, to CONNECTION's peer.
@@ -403,6 +611,8 @@ those."
   (let ((connection (spyglass--process-connection process)))
     (when (and connection (eq process (spyglass-connection-process connection)))
       (setf (spyglass-connection-last-recv connection) (float-time))
+      (when-let* ((pace (process-get process 'spyglass-pace)))
+        (cl-incf (spyglass--pace-read pace) (length chunk)))
       (let ((frames
              (condition-case err
                  (spyglass-wire-feed (spyglass-connection-reader connection) chunk
@@ -414,6 +624,10 @@ those."
                 (spyglass--drop connection)
                 nil)))
             (inbox (process-get process 'spyglass-inbox)))
+        (when (spyglass-connection-authenticated connection)
+          (setq frames (spyglass--pace-take-acks process frames)))
+        (when (eq process (spyglass-connection-process connection))
+          (spyglass--pace-acknowledge connection process))
         (cond
          ((null frames))
          (inbox (spyglass--queue-push connection inbox frames (length chunk) "handled"))
@@ -448,6 +662,7 @@ The mirror module acknowledges updates there, once per chunk.")
     (cond
      ((not (spyglass-connection-authenticated connection))
       (spyglass--handshake connection header))
+     ((spyglass--pace-receive connection header payload))
      ((equal type "ping")
       (spyglass--send connection (list :t "pong" :t0 (plist-get header :t0)
                                        :t1 (float-time))))
@@ -468,14 +683,20 @@ The mirror module acknowledges updates there, once per chunk.")
 ;;;; Handshake
 
 (defun spyglass--hello (connection)
-  "Send CONNECTION's peer our hello."
-  (spyglass--send connection
-                  (append (list :t "hello" :proto spyglass-wire-protocol
-                                :app "spyglass" :id spyglass-instance-id
-                                :name (or spyglass-instance-name (system-name))
-                                :caps (vconcat spyglass-wire-capabilities))
-                          (and (spyglass-connection-token connection)
-                               (list :token (spyglass-connection-token connection))))))
+  "Send CONNECTION's peer our hello.
+It says how often to acknowledge what the peer reads when our writes
+on the stream block, for pacing it (see `spyglass--pace-start')."
+  (let* ((process (spyglass-connection-process connection))
+         (pace (and process (process-get process 'spyglass-pace))))
+    (spyglass--send connection
+                    (append (list :t "hello" :proto spyglass-wire-protocol
+                                  :app "spyglass" :id spyglass-instance-id
+                                  :name (or spyglass-instance-name (system-name))
+                                  :caps (vconcat spyglass-wire-capabilities))
+                            (and pace (spyglass--writes-block-p process)
+                                 (list :pace (/ (spyglass--pace-window pace) 4)))
+                            (and (spyglass-connection-token connection)
+                                 (list :token (spyglass-connection-token connection)))))))
 
 (defun spyglass--handshake (connection header)
   "Check HEADER, the first message from CONNECTION's peer."
@@ -519,6 +740,7 @@ The mirror module acknowledges updates there, once per chunk.")
               (spyglass-connection-peer-caps connection)
               (and (vectorp caps) (cl-remove-if-not #'stringp (append caps nil)))
               (spyglass-connection-attempts connection) 0)
+        (spyglass--pace-start connection header)
         (when server
           (spyglass--hello connection))
         (spyglass--set-state connection 'open)
@@ -684,6 +906,8 @@ dropped within that after TIMEOUT."
   (set-process-filter process #'spyglass--filter)
   (set-process-sentinel process #'spyglass--sentinel)
   (process-put process 'spyglass-connection (spyglass--ref connection))
+  (process-put process 'spyglass-pace
+               (spyglass--make-pace :window (max 4096 spyglass-pace-window)))
   (spyglass-wire-free-reader (spyglass-connection-reader connection))
   (setf (spyglass-connection-process connection) process
         (spyglass-connection-reader connection) (spyglass-wire-make-reader)
@@ -718,6 +942,9 @@ Return what it wrote to standard error, trimmed, or nil."
                       (string-trim (buffer-string))))))
     (process-put process 'spyglass-connection nil)
     (when (process-live-p process) (delete-process process))
+    (when-let* ((pace (process-get process 'spyglass-pace)))
+      (spyglass-wire-free-reader (spyglass--pace-fragments pace))
+      (setf (spyglass--pace-fragments pace) nil))
     (when sink
       (when (process-live-p sink) (delete-process sink))
       (when (buffer-live-p buffer) (kill-buffer buffer)))
@@ -949,6 +1176,25 @@ milliseconds."
 (defvar spyglass--server nil
   "The server of this Emacs, or nil.")
 
+(defvar spyglass--server-stopped nil
+  "When a server last stopped listening on Windows, as a float time, or nil.")
+
+(defconst spyglass--listener-linger 0.6
+  "Seconds after which a listener deleted on Windows leaves its descriptor alone.
+Emacs on Windows waits for connections in a thread per listener, which
+looks every 500 ms whether its listener still lives (`_sys_wait_accept'
+in w32.c).  Until it does, a listener made meanwhile, given the same
+descriptor, accepts one connection, then none: the old thread cancels
+its notifications.")
+
+(defun spyglass--wait-listener-linger ()
+  "Wait until a server stopped on Windows no longer disturbs a new one."
+  (when spyglass--server-stopped
+    (let ((left (- (+ spyglass--server-stopped spyglass--listener-linger) (float-time))))
+      (when (> left 0)
+        (sleep-for left)))
+    (setq spyglass--server-stopped nil)))
+
 (defcustom spyglass-registration-file
   (locate-user-emacs-file "spyglass/server.json")
   "File where the server writes its port and token for clients.
@@ -977,18 +1223,22 @@ the same SSH connection they forward the port through."
   "Start listening on 127.0.0.1 and return the server.
 PORT 0, the default, lets the system choose one.  The port and a
 fresh random token are written to FILE, unless FILE is nil.  When a
-server already runs, return it."
+server already runs, return it.  On Windows, a server started less
+than `spyglass--listener-linger' seconds after the last one stopped
+waits for them to pass first."
   (or (and spyglass--server
            (process-live-p (spyglass-server-process spyglass--server))
            spyglass--server)
       (let* ((token (spyglass-wire-random-token))
              (server (spyglass--make-server :token token))
-             (process (make-network-process
-                       :name "spyglass-server" :server t :host "127.0.0.1"
-                       :service port :family 'ipv4 :coding 'binary :noquery t
-                       :filter #'spyglass--filter :sentinel #'spyglass--sentinel
-                       :log (lambda (_server client _message)
-                              (spyglass--accept server client)))))
+             (process (progn
+                        (spyglass--wait-listener-linger)
+                        (make-network-process
+                         :name "spyglass-server" :server t :host "127.0.0.1"
+                         :service port :family 'ipv4 :coding 'binary :noquery t
+                         :filter #'spyglass--filter :sentinel #'spyglass--sentinel
+                         :log (lambda (_server client _message)
+                                (spyglass--accept server client))))))
         (setf (spyglass-server-process server) process
               (spyglass-server-port server) (process-contact process :service))
         (when file
@@ -1011,7 +1261,10 @@ Connections already accepted stay."
   (when spyglass--server
     (let ((process (spyglass-server-process spyglass--server))
           (file (spyglass-server-file spyglass--server)))
-      (when (process-live-p process) (delete-process process))
+      (when (process-live-p process)
+        (delete-process process)
+        (when (eq system-type 'windows-nt)
+          (setq spyglass--server-stopped (float-time))))
       (when (and file (file-exists-p file))
         (ignore-errors (delete-file file))))
     (setq spyglass--server nil)))

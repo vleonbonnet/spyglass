@@ -72,6 +72,7 @@ Nothing below prompts; every function returns at once, and what happens on the n
 - =spyglass-connection-state-functions=, =spyglass-shares-changed-functions=, =spyglass-error-functions= :: Hooks on every connection's state, a peer's shares, and errors.
 - =spyglass-connection-attach-functions=, =spyglass-connection-detach-functions= :: Hooks run with a connection as each stream's handshake succeeds, and with (CONNECTION FINAL) as a stream ends, FINAL non-nil when the connection will not come back.
 - =(spyglass-connection-set-heartbeat CONNECTION INTERVAL TIMEOUT)= :: Heartbeats of one connection: every INTERVAL seconds of silence, the peer dropped after TIMEOUT, instead of =spyglass-heartbeat-interval= and =spyglass-heartbeat-timeout=. Seconds, integers or floats, positive, INTERVAL below TIMEOUT, else an error; nil keeps the default. A silent peer is dropped within TIMEOUT and half the shorter of INTERVAL and TIMEOUT − INTERVAL.
+- =spyglass-pace-window= :: Emacs on Windows writes to sockets without reading meanwhile, so that two Emacs on one Windows host writing to each other more than the system buffers would each wait for the other forever. A stream both of whose ends write so is paced: at most this much (64 KB) written and not yet read by the peer, frames in fragments of a quarter of it. Streams with an end elsewhere, as SSH from a Mac to Windows, are not paced. See [[file:doc/design.org][the design notes]].
 
 ** Channels
 

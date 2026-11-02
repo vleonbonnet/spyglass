@@ -277,38 +277,46 @@ They wait while a handler's write waits for the peer to read."
         (kill-buffer buffer)))))
 
 (ert-deftest spyglass-conn-reconnect ()
-  "`spyglass-reconnect' breaks a stream on either end; mirrors resume."
+  "`spyglass-reconnect' breaks a stream on either end; mirrors resume.
+Each step waits for the mirror to resume, a round trip after the
+connection is open again: breaking the stream before would end the
+resumption under way, and the mirror would resume fewer times."
   (spyglass-conn-test--with (client server)
     (let ((buffer (generate-new-buffer "reconnect")))
       (unwind-protect
           (let ((mirror (spyglass-test-mirror client buffer)))
-            ;; The connecting end.
-            (let ((process (spyglass-connection-process client)))
-              (should (spyglass-reconnect client))
-              (should-not (process-live-p process))
-              (spyglass-test-wait (lambda () (spyglass-connection-live-p client)))
-              (should (spyglass-connection-live-p client)))
-            ;; Waiting to connect again: now.
-            (let ((spyglass-reconnect-delays '(5)))
-              (spyglass-connection-drop-stream client))
-            (should (eq (spyglass-connection-state client) 'reconnecting))
-            (let ((start (float-time)))
-              (should (spyglass-reconnect client))
-              (spyglass-test-wait (lambda () (spyglass-connection-live-p client)) 4)
-              (should (spyglass-connection-live-p client))
-              (should (< (- (float-time) start) 4)))
-            ;; The accepting end: the peer comes back, the stream is adopted.
-            (setq server (spyglass-test-wait (lambda () (spyglass-test-other-end client))))
-            (should (spyglass-reconnect server))
-            (should-not (spyglass-reconnect server))
-            (spyglass-test-wait (lambda () (spyglass-connection-live-p server)) 8)
-            (should (spyglass-connection-live-p server))
-            (with-current-buffer buffer (insert "after reconnecting\n"))
-            (spyglass-test-converge buffer mirror)
-            (should (eq (spyglass-mirror-state mirror) 'live))
-            (should (>= (plist-get (spyglass-mirror-stats mirror) :resumes) 2))
-            (spyglass-disconnect client)
-            (should-not (spyglass-reconnect client)))
+            (cl-flet ((resumed (&optional timeout)
+                        (spyglass-test-wait (lambda () (and (spyglass-connection-live-p client)
+                                                            (eq (spyglass-mirror-state mirror) 'live)))
+                                            timeout)
+                        (should (spyglass-connection-live-p client))
+                        (should (eq (spyglass-mirror-state mirror) 'live))))
+              ;; The connecting end.
+              (let ((process (spyglass-connection-process client)))
+                (should (spyglass-reconnect client))
+                (should-not (process-live-p process))
+                (resumed))
+              ;; Waiting to connect again: now.
+              (let ((spyglass-reconnect-delays '(5)))
+                (spyglass-connection-drop-stream client))
+              (should (eq (spyglass-connection-state client) 'reconnecting))
+              (let ((start (float-time)))
+                (should (spyglass-reconnect client))
+                (resumed 4)
+                (should (< (- (float-time) start) 4)))
+              ;; The accepting end: the peer comes back, the stream is adopted.
+              (setq server (spyglass-test-wait (lambda () (spyglass-test-other-end client))))
+              (should (spyglass-reconnect server))
+              (should-not (spyglass-reconnect server))
+              (spyglass-test-wait (lambda () (spyglass-connection-live-p server)) 8)
+              (should (spyglass-connection-live-p server))
+              (resumed)
+              (with-current-buffer buffer (insert "after reconnecting\n"))
+              (spyglass-test-converge buffer mirror)
+              (should (eq (spyglass-mirror-state mirror) 'live))
+              (should (>= (plist-get (spyglass-mirror-stats mirror) :resumes) 3))
+              (spyglass-disconnect client)
+              (should-not (spyglass-reconnect client))))
         (kill-buffer buffer)))))
 
 (defun spyglass-conn-test--fill (buffer lines tag)
@@ -433,26 +441,30 @@ arithmetic gave 0 for 1, a timer that never repeated."
       (should (seq-some (lambda (m) (string-match-p "not below timeout" m)) spyglass-test-errors))
       (should (eql (timer--repeat-delay (spyglass-connection-timer server)) 5.0)))))
 
-(defun spyglass-conn-test--start-peer (dir)
+(defun spyglass-conn-test--start-peer (dir &optional setup life)
   "Start another batch Emacs serving spyglass, registered in DIR.
-Return (PROCESS . PID): PROCESS runs it under `timeout', PID is that
-Emacs's own, from its registration.  It exits by itself after a
-minute."
+SETUP, a form, runs in it before it serves; it serves for LIFE
+seconds, 60 by default, and is killed 30 seconds after.  Return
+\(PROCESS . PID): PROCESS runs it under `timeout', PID is that Emacs's
+own, from its registration."
   (let* ((file (expand-file-name "server.json" dir))
          (source (file-name-directory (locate-library "spyglass")))
          (emacs (expand-file-name invocation-name invocation-directory))
-         (form (format "(progn (spyglass-server-start :file %S) (let ((end (+ (float-time) 60))) (while (< (float-time) end) (accept-process-output nil 0.05))))"
-                       file))
+         (life (or life 60))
+         (form (format "(progn %S (spyglass-server-start :file %S) (let ((end (+ (float-time) %d))) (while (< (float-time) end) (accept-process-output nil 0.05))))"
+                       setup file life))
+         (command (list "timeout" (number-to-string (+ life 30))
+                        emacs "-Q" "--batch" "-L" source
+                        "--eval" "(setq load-prefer-newer t)" "-l" "spyglass" "--eval" form))
          (process (make-process
                    :name "spyglass-peer" :connection-type 'pipe :noquery t
                    :buffer (generate-new-buffer " *spyglass-peer*")
-                   :command (list "sh" "-c"
-                                  (concat "trap '' PIPE; exec timeout 90 "
-                                          (mapconcat #'shell-quote-argument
-                                                     (list emacs "-Q" "--batch" "-L" source
-                                                           "--eval" "(setq load-prefer-newer t)"
-                                                           "-l" "spyglass" "--eval" form)
-                                                     " "))))))
+                   :command (if (eq system-type 'windows-nt)
+                                command
+                              (let ((shell-file-name "sh"))
+                                (list "sh" "-c"
+                                      (concat "trap '' PIPE; exec "
+                                              (mapconcat #'shell-quote-argument command " "))))))))
     (spyglass-test-wait (lambda () (or (file-exists-p file) (not (process-live-p process)))) 30)
     (let ((pid (and (file-exists-p file)
                     (with-temp-buffer
@@ -514,6 +526,176 @@ frozen peer stayed connected for as long as it was stopped."
         (when (process-live-p (car peer)) (delete-process (car peer)))
         (kill-buffer buffer))
       (delete-directory dir t))))
+
+(ert-deftest spyglass-conn-paced-streams ()
+  "Frames are written whole, in order and bounded on paced streams too.
+Streams both of whose ends' writes block, as Emacs's sockets on
+Windows, are paced: these tests run so on any system."
+  (let ((spyglass--pace-streams t))
+    (dolist (test '(spyglass-conn-frame-whole-while-filter-answers
+                    spyglass-conn-frame-whole-while-mirror-acknowledges
+                    spyglass-conn-frame-whole-while-timer-sends
+                    spyglass-conn-frame-whole-while-channel-answers
+                    spyglass-conn-frames-handled-in-order
+                    spyglass-conn-queue-bounded
+                    spyglass-conn-inbox-bounded
+                    spyglass-conn-failed-write-drops-stream
+                    spyglass-conn-reconnect
+                    spyglass-conn-mirrors-both-ways-slow-readers))
+      (ert-info ((symbol-name test))
+        (funcall (ert-test-body (ert-get-test test)))))))
+
+(ert-deftest spyglass-conn-paced-window ()
+  "A paced stream keeps what the peer has not read within the window.
+A frame larger than a quarter of it goes in fragments, which the other
+end puts together; both ends acknowledge what they read."
+  (let ((spyglass--pace-streams t)
+        (spyglass-pace-window (* 32 1024))
+        (unread 0)
+        (fragments 0))
+    (cl-flet ((watch (_process pace _string)
+                (setq unread (max unread (- (spyglass--pace-written pace)
+                                            (spyglass--pace-acked pace)))))
+              (count (_connection header _payload)
+                (when (equal (plist-get header :t) "fr")
+                  (cl-incf fragments))))
+      (advice-add 'spyglass--put :after #'watch)
+      (advice-add 'spyglass--pace-receive :before #'count)
+      (unwind-protect
+          (spyglass-conn-test--with (client server)
+            (let ((ours (process-get (spyglass-connection-process client) 'spyglass-pace))
+                  (theirs (process-get (spyglass-connection-process server) 'spyglass-pace))
+                  (payload (make-string (* 2 1024 1024) ?w)))
+              (should (= (spyglass--pace-interval ours) (* 8 1024)))
+              (should (= (spyglass--pace-interval theirs) (* 8 1024)))
+              (should (spyglass--send-frame client (spyglass-wire-frame (list :t "tst" :n 1)
+                                                                        payload)))
+              (spyglass-test-wait (lambda () spyglass-conn-test--frames) 10)
+              (should (equal (nth 2 (car spyglass-conn-test--frames)) payload))
+              (should (eq (car (car spyglass-conn-test--frames)) server))
+              (should (>= fragments 256))
+              (should (> (spyglass--pace-acked ours) (* 2 1000 1000)))
+              ;; Acknowledgments go beyond the window, a few bytes each.
+              (should (<= unread (+ spyglass-pace-window 1024)))
+              (should-not spyglass-test-errors)))
+        (advice-remove 'spyglass--put #'watch)
+        (advice-remove 'spyglass--pace-receive #'count)))))
+
+(ert-deftest spyglass-conn-paced-only-when-both-block ()
+  "A stream is paced only when both ends say their writes block.
+The peer's hello tells how often to acknowledge, within bounds; a peer
+not announcing the capability \"pc\" is never paced, nor one whose
+writes do not block."
+  (spyglass-conn-test--with (client _server)
+    (let* ((process (spyglass-connection-process client))
+           (pace (process-get process 'spyglass-pace)))
+      (cl-flet ((start (header)
+                  (setf (spyglass--pace-interval pace) nil)
+                  (spyglass--pace-start client header)
+                  (spyglass--pace-interval pace)))
+        (let ((spyglass--pace-streams t))
+          (should (= (start '(:pace 4096)) 4096))
+          (should (= (start '(:pace 1)) 1024))
+          (should (= (start (list :pace (* 2 spyglass-max-frame-size))) spyglass-max-frame-size))
+          (should-not (start '(:pace -5)))
+          (should-not (start '(:pace "4096")))
+          (should-not (start nil))
+          (let ((caps (spyglass-connection-peer-caps client)))
+            (setf (spyglass-connection-peer-caps client) (remove "pc" caps))
+            (unwind-protect
+                (should-not (start '(:pace 4096)))
+              (setf (spyglass-connection-peer-caps client) caps))))
+        (unless (eq system-type 'windows-nt)
+          (should-not (start '(:pace 4096))))))))
+
+(ert-deftest spyglass-conn-server-restarted-accepts ()
+  "A server started right after another stopped accepts connection after connection.
+On Windows, the thread waiting for a deleted listener's connections
+notices only at its next look, every 500 ms; meanwhile a listener
+given its descriptor accepted one connection, and never another."
+  (let ((accepted 0))
+    (cl-flet ((count (&rest _) (cl-incf accepted))
+              (accept-one ()
+                (let ((before accepted)
+                      (client (make-network-process
+                               :name "restart" :host "127.0.0.1"
+                               :service (spyglass-server-port (spyglass-server))
+                               :coding 'binary :noquery t :filter #'ignore)))
+                  (spyglass-test-wait (lambda () (> accepted before)) 3)
+                  (delete-process client)
+                  (> accepted before))))
+      (advice-add 'spyglass--accept :before #'count)
+      (unwind-protect
+          (progn
+            (spyglass-test-start)
+            (should (accept-one))
+            (spyglass-test-stop)
+            (spyglass-test-start)
+            (should (accept-one))
+            ;; Past the old thread's next look.
+            (spyglass-test-settle 0.7)
+            (should (accept-one)))
+        (advice-remove 'spyglass--accept #'count)
+        (spyglass-test-stop)))))
+
+(ert-deftest spyglass-conn-two-emacs-write-at-once ()
+  "Two Emacs sending each other large messages at once both get the other's.
+Emacs on Windows writes to sockets without reading meanwhile: two Emacs
+on one Windows host, each writing more than the system buffers, each
+waited for the other to read, forever.  Both ends' writes blocking,
+the stream is paced, and then on any system when forced."
+  (skip-unless (executable-find "timeout"))
+  (let ((size (* 4 1024 1024)))
+    (dolist (paced '(nil t))
+      (ert-info ((format "paced %s" paced))
+        (let* ((dir (make-temp-file "spyglass-peer-" t))
+               (peer (spyglass-conn-test--start-peer
+                      dir
+                      `(progn
+                         (setq spyglass--pace-streams ,paced)
+                         (spyglass-register-channel
+                          "tst" (lambda (c m)
+                                  (spyglass-channel-send
+                                   c "tst" (list :got (length (plist-get m :s)))))
+                          :attach (lambda (c)
+                                    (spyglass-channel-send c "tst" (list :s (make-string ,size ?p)))))
+                         (add-hook 'spyglass-connection-detach-functions
+                                   (lambda (_c final) (when final (kill-emacs 0)))))
+                      40))
+               (spyglass--pace-streams paced)
+               (spyglass-test-errors nil)
+               (received nil)
+               (connection nil))
+          (spyglass-register-channel
+           "tst" (lambda (_c m) (push m received))
+           :attach (lambda (c) (spyglass-channel-send c "tst" (list :s (make-string size ?o)))))
+          (unwind-protect
+              (progn
+                (setq connection (spyglass-connect (spyglass-file-transport
+                                                    (expand-file-name "server.json" dir))
+                                                   :name "writer"))
+                (spyglass-test-wait (lambda ()
+                                      (and (cl-find size received
+                                                    :key (lambda (m) (length (plist-get m :s))))
+                                           (cl-find size received
+                                                    :key (lambda (m) (plist-get m :got)))))
+                                    30)
+                (should (cl-find size received :key (lambda (m) (length (plist-get m :s)))))
+                (should (cl-find size received :key (lambda (m) (plist-get m :got))))
+                (should-not spyglass-test-errors)
+                (should (spyglass-connection-live-p connection))
+                (should (eq (and (spyglass--pace-interval
+                                  (process-get (spyglass-connection-process connection)
+                                               'spyglass-pace))
+                                 t)
+                            (or paced (eq system-type 'windows-nt)))))
+            (spyglass-unregister-channel "tst")
+            (when connection (spyglass-disconnect connection))
+            (spyglass-test-wait (lambda () (not (process-live-p (car peer)))) 10)
+            (let ((buffer (process-buffer (car peer))))
+              (when (process-live-p (car peer)) (delete-process (car peer)))
+              (kill-buffer buffer))
+            (delete-directory dir t)))))))
 
 (provide 'spyglass-conn-test)
 ;;; spyglass-conn-test.el ends here

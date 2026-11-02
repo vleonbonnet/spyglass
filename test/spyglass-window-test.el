@@ -39,6 +39,12 @@
         (and (= (length words) 2)
              (cons (string-to-number (cadr words)) (string-to-number (car words))))))))
 
+(defun spyglass-window-test--ptys-p ()
+  "Return non-nil when processes may run in ptys, whose size `stty' reads.
+Emacs on Windows runs every process through pipes: there is no pty to
+size, and `process-tty-name' is nil."
+  (not (memq system-type '(windows-nt ms-dos))))
+
 (defun spyglass-window-test--report (mirror)
   "Report MIRROR's window size now, as its window change functions would."
   (setf (spyglass--mirror-sent-size (buffer-local-value 'spyglass--mirror mirror)) nil)
@@ -98,6 +104,7 @@
 
 (ert-deftest spyglass-window-reports-size-pty ()
   "A viewer's window sizes a pty no owner's window shows, as it changes."
+  (skip-unless (spyglass-window-test--ptys-p))
   (spyglass-test-with-connection connection
     (let ((buffer (spyglass-window-test--pty-buffer "pty")))
       (unwind-protect
@@ -140,6 +147,7 @@
 
 (ert-deftest spyglass-window-owner-wins-when-active ()
   "The most recently active party sizes the terminal; owners' windows keep theirs."
+  (skip-unless (spyglass-window-test--ptys-p))
   (spyglass-test-with-connection connection
     (let ((buffer (spyglass-window-test--pty-buffer "active")))
       (unwind-protect
@@ -181,6 +189,7 @@
 
 (ert-deftest spyglass-window-focus-makes-the-viewer-latest ()
   "Selecting a mirror's window gives its viewer the terminal's size."
+  (skip-unless (spyglass-window-test--ptys-p))
   (spyglass-test-with-connection connection
     (let ((buffer (spyglass-window-test--pty-buffer "focus")))
       (unwind-protect
@@ -248,6 +257,7 @@
 
 (ert-deftest spyglass-window-smallest-policy ()
   "Under `smallest', the smallest of the owner's and viewer's windows wins."
+  (skip-unless (spyglass-window-test--ptys-p))
   (let ((spyglass-size-policy 'smallest))
     (spyglass-test-with-connection connection
       (let ((buffer (spyglass-window-test--pty-buffer "smallest")))
