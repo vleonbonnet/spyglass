@@ -256,11 +256,14 @@
            ("stream-50MB/s" "stream" (:rate 50000000 :seconds 4 :keep 8000000 :baseline t) nil)
            ("term-80x200" "term" (:rows 80 :cols 200 :hz 60 :seconds 5 :hint t :baseline t) nil)
            ("term-50x300" "term" (:rows 50 :cols 300 :hz 60 :seconds 5 :hint t :baseline t) nil)
-           ("term-80x200-unhinted" "term" (:rows 80 :cols 200 :hz 60 :seconds 5 :hint :false
+           ("term-80x200-unhinted" "term" (:rows 80 :cols 200 :hz 60 :seconds 5 :hint nil
                                                  :baseline t)
             nil)
            ("overlays-2000" "overlays" (:paragraphs 2000 :baseline t) nil)
-           ("eat-seq-300k" "eat" (:count 300000) (:eat t))
+           ("eat-seq-300k" "terminal" (:kind "eat" :count 300000) (:terminal "eat"))
+           ("vterm-seq-300k" "terminal" (:kind "vterm" :count 300000) (:terminal "vterm"))
+           ("ghostel-seq-300k" "terminal" (:kind "ghostel" :count 300000)
+            (:terminal "ghostel"))
            ("reconnect-appends" "appends" (:count 100000) (:drops 3))))
         (only (spyglass-bench--getenv "SPYGLASS_BENCH_ONLY")))
     (if only
@@ -268,14 +271,23 @@
           (cl-remove-if-not (lambda (s) (member (car s) names)) all))
       all)))
 
+(defvar spyglass-bench--drop-timers nil
+  "Timers breaking the stream during a scenario.")
+
 (defun spyglass-bench--drops (count)
-  "Break the connection's stream COUNT times, a second apart."
+  "Break the connection's stream COUNT times, 0.3 s apart."
   (dotimes (i count)
-    (run-with-timer (+ 0.5 i) nil
-                    (lambda ()
-                      (when (spyglass-connection-live-p spyglass-bench--connection)
-                        (spyglass-bench--log "dropping the stream")
-                        (spyglass-connection-drop-stream spyglass-bench--connection))))))
+    (push (run-with-timer (+ 0.2 (* 0.3 i)) nil
+                          (lambda ()
+                            (when (spyglass-connection-live-p spyglass-bench--connection)
+                              (spyglass-bench--log "dropping the stream")
+                              (spyglass-connection-drop-stream spyglass-bench--connection))))
+          spyglass-bench--drop-timers)))
+
+(defun spyglass-bench--cancel-drops ()
+  "Cancel the drops not done yet."
+  (mapc #'cancel-timer spyglass-bench--drop-timers)
+  (setq spyglass-bench--drop-timers nil))
 
 (defun spyglass-bench--json-args (args)
   "Return ARGS with nil as false, for JSON."
@@ -283,16 +295,16 @@
 
 (defun spyglass-bench--agent-owns (scenario args options)
   "Play SCENARIO with ARGS and OPTIONS, the agent owning; return measurements."
-  ;; A viewer of Eat terminals has Eat, and its faces, as the owner does.
-  (when (and (plist-get options :eat) spyglass-bench-eat-dir)
-    (add-to-list 'load-path spyglass-bench-eat-dir)
-    (require 'eat))
+  ;; A viewer of terminals has the emulator, and its faces, as the owner does.
+  (when (and (plist-get options :terminal)
+             (spyglass-bench-terminal-available-p (plist-get options :terminal)))
+    (spyglass-bench-load-terminal (plist-get options :terminal)))
   (let ((prepared (spyglass-bench--command "prepare" :scenario scenario
                                            :args (spyglass-bench--json-args args))))
     (let ((mirror (spyglass-bench-viewer-open spyglass-bench--connection)))
       (spyglass-bench-wait (lambda () (eq (spyglass-mirror-state mirror) 'live)) 120)
       (when (plist-get options :drops) (spyglass-bench--drops (plist-get options :drops)))
-      (let* ((owner (spyglass-bench--command "run"))
+      (let* ((owner (prog1 (spyglass-bench--command "run") (spyglass-bench--cancel-drops)))
              (_ (spyglass-bench-wait (lambda () (eq (spyglass-mirror-state mirror) 'live)) 60))
              (viewer (spyglass-bench-viewer-result)))
         (spyglass-bench-viewer-cleanup)
@@ -302,11 +314,14 @@
 (defun spyglass-bench--driver-owns (scenario args options)
   "Play SCENARIO with ARGS and OPTIONS, the driver owning; return measurements."
   (let* ((prepared (spyglass-bench-owner-prepare scenario args)))
-    (spyglass-bench--command "open")
+    (apply #'spyglass-bench--command "open"
+           (and (plist-get options :terminal)
+                (list :args (list :kind (plist-get options :terminal)))))
     (when (plist-get options :drops) (spyglass-bench--drops (plist-get options :drops)))
     (let ((owner nil))
       (spyglass-bench-owner-run (lambda (result) (setq owner result)))
       (spyglass-bench-wait (lambda () (or owner spyglass-bench--abort)) 580)
+      (spyglass-bench--cancel-drops)
       (unless owner (error "The scenario did not finish"))
       (spyglass-bench-wait (lambda () (spyglass-connection-live-p spyglass-bench--connection)) 60)
       (let ((viewer (spyglass-bench--command "result")))
@@ -395,28 +410,28 @@
 (defun spyglass-bench-main ()
   "Run the benchmarks and print their table."
   (setq spyglass-bench--remote (spyglass-bench--getenv "SPYGLASS_BENCH_REMOTE"))
-  (setq spyglass-bench-eat-dir (spyglass-bench--getenv "SPYGLASS_EAT_EL"))
+  (spyglass-bench-read-environment)
   (spyglass-bench-start-guard)
   (add-hook 'spyglass-error-functions
             (lambda (_c msg) (spyglass-bench--log "error: %s" msg)))
   (let ((rows nil) (failed nil)
-        (process-environment (cons (concat "SPYGLASS_EAT_EL="
-                                           (or (and (not spyglass-bench--remote)
-                                                    spyglass-bench-eat-dir)
-                                               ""))
-                                   process-environment)))
+        (process-environment (if spyglass-bench--remote
+                                 (append '("SPYGLASS_EAT_EL=" "SPYGLASS_VTERM_EL="
+                                           "SPYGLASS_GHOSTEL_EL=")
+                                         process-environment)
+                               process-environment)))
     (unwind-protect
         (progn
           (spyglass-bench--start-agent)
           (dolist (s (spyglass-bench--scenarios))
             (pcase-let ((`(,name ,scenario ,args ,options) s))
               (dolist (direction '(agent driver))
-                (if (and (plist-get options :eat)
-                         (or (not spyglass-bench-eat-dir)
-                             (and spyglass-bench--remote (eq direction 'driver))
-                             (and spyglass-bench--remote
-                                  (equal (plist-get spyglass-bench--ready :system) "windows-nt"))))
-                    (spyglass-bench--log "%s %s: skipped, no Eat there" name direction)
+                (if (and (plist-get options :terminal)
+                         (or (not (spyglass-bench-terminal-available-p
+                                   (plist-get options :terminal)))
+                             spyglass-bench--remote))
+                    (spyglass-bench--log "%s %s: skipped, no %s on both ends"
+                                         name direction (plist-get options :terminal))
                   (spyglass-bench--log "%s, %s owning..." name direction)
                   (when (spyglass-bench--getenv "SPYGLASS_BENCH_PROFILE")
                     (require 'profiler)
@@ -453,6 +468,15 @@
                         (unless (spyglass-bench--same-p (plist-get result :owner)
                                                         (plist-get result :viewer))
                           (push name failed)
+                          (let ((a (append (plist-get (plist-get (plist-get result :owner) :digest)
+                                                      :overlay-list) nil))
+                                (b (append (plist-get (plist-get (plist-get result :viewer) :digest)
+                                                      :overlay-list) nil)))
+                            (when (or a b)
+                              (spyglass-bench--log "overlays only on the owner: %S"
+                                                   (seq-take (cl-set-difference a b :test #'equal) 6))
+                              (spyglass-bench--log "overlays only on the viewer: %S"
+                                                   (seq-take (cl-set-difference b a :test #'equal) 6))))
                           (spyglass-bench--log "digests differ: %S / %S"
                                                (plist-get (plist-get result :owner) :digest)
                                                (plist-get (plist-get result :viewer) :digest)))

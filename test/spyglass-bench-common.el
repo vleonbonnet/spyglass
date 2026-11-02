@@ -38,7 +38,8 @@
 ;; - overlays: text streamed in paragraphs, each given overlays with
 ;;   faces, display strings and before-strings, some removed and
 ;;   remade, as agent-shell's Markdown rendering does.
-;; - eat: a real Eat terminal running `seq 1 COUNT'.
+;; - terminal: a real terminal of KIND, Eat, vterm or Ghostel, running
+;;   `seq 1 COUNT'.
 
 ;;; Code:
 
@@ -150,7 +151,9 @@ The digests of a buffer and of its exact mirror are equal."
                                             (or (< (car a) (car b))
                                                 (and (= (car a) (car b))
                                                      (< (cadr a) (cadr b))))))))
-                :overlay-count (length ovs)))))))
+                :overlay-count (length ovs)
+                :overlay-list (and (getenv "SPYGLASS_BENCH_DEBUG")
+                                   (vconcat (mapcar #'prin1-to-string ovs)))))))))
 
 ;;;; Text
 
@@ -363,17 +366,75 @@ made again, as a Markdown renderer redraws."
 (defvar spyglass-bench-eat-dir nil
   "Directory of eat.el, or nil when Eat is not available.")
 
-(defun spyglass-bench-make-eat (count)
-  "Return a new Eat terminal that will print 1 to COUNT, or nil without Eat."
-  (when (and spyglass-bench-eat-dir (not (memq system-type '(windows-nt ms-dos))))
-    (add-to-list 'load-path spyglass-bench-eat-dir)
-    (require 'eat)
-    (require 'spyglass-eat)
-    (let ((buffer (eat-make "bench-eat" "/bin/sh" nil "-c"
-                            (format "sleep 1; seq 1 %d; printf '\\033[1;31mdone\\033[0m\\n'; sleep 2"
-                                    count))))
-      (with-current-buffer buffer (rename-buffer "bench" t))
-      buffer)))
+(defvar spyglass-bench-vterm-dir nil
+  "Directory of vterm.el and its built module, or nil.")
+
+(defvar spyglass-bench-ghostel-dir nil
+  "Directory of ghostel.el, or nil.")
+
+(defvar spyglass-bench-ghostel-module-dir nil
+  "Directory of Ghostel's native module, or nil.")
+
+(defun spyglass-bench-read-environment ()
+  "Locate the terminal emulators from the environment, as the Makefile sets it."
+  (cl-flet ((dir (name) (let ((d (getenv name))) (and d (not (string-empty-p d)) d))))
+    (setq spyglass-bench-eat-dir (dir "SPYGLASS_EAT_EL")
+          spyglass-bench-vterm-dir (dir "SPYGLASS_VTERM_EL")
+          spyglass-bench-ghostel-dir (dir "SPYGLASS_GHOSTEL_EL")
+          spyglass-bench-ghostel-module-dir (dir "SPYGLASS_GHOSTEL_MODULE_DIR"))))
+
+(defun spyglass-bench-terminal-available-p (kind)
+  "Return non-nil when terminals of KIND can run in this Emacs."
+  (and (not (memq system-type '(windows-nt ms-dos)))
+       (pcase kind
+         ("eat" spyglass-bench-eat-dir)
+         ("vterm" spyglass-bench-vterm-dir)
+         ("ghostel" (and spyglass-bench-ghostel-dir spyglass-bench-ghostel-module-dir)))))
+
+(defun spyglass-bench-load-terminal (kind)
+  "Load the terminal emulator KIND and its adapter."
+  (pcase kind
+    ("eat" (add-to-list 'load-path spyglass-bench-eat-dir)
+     (require 'eat) (require 'spyglass-eat))
+    ("vterm" (add-to-list 'load-path spyglass-bench-vterm-dir)
+     (require 'vterm) (require 'spyglass-vterm)
+     ;; The digest is taken after the program exits.
+     (setq vterm-kill-buffer-on-exit nil))
+    ("ghostel" (add-to-list 'load-path spyglass-bench-ghostel-dir)
+     (defvar ghostel-module-directory)
+     (defvar ghostel-module-auto-install)
+     (setq ghostel-module-directory spyglass-bench-ghostel-module-dir
+           ghostel-module-auto-install nil)
+     (require 'ghostel) (require 'spyglass-ghostel)
+     (setq ghostel-kill-buffer-on-exit nil))))
+
+(declare-function eat-make "eat" (name program &optional startfile &rest switches))
+(declare-function vterm-mode "vterm" ())
+(declare-function ghostel-exec "ghostel" (buffer program &optional args identity))
+(defvar vterm-shell)
+(defvar vterm-kill-buffer-on-exit)
+(defvar ghostel-kill-buffer-on-exit)
+
+(defun spyglass-bench-make-terminal (kind count)
+  "Return a new terminal of KIND printing 1 to COUNT, in colors, then exiting."
+  (spyglass-bench-load-terminal kind)
+  (let* ((script (format "sleep 1; seq 1 %d; printf '\\033[1;31mdone\\033[0m\\n'; sleep 2"
+                         count))
+         (buffer
+          (pcase kind
+            ("eat" (eat-make "bench-eat" "/bin/sh" nil "-c" script))
+            ("vterm" (with-current-buffer (generate-new-buffer "bench-vterm")
+                       (let ((vterm-shell (format "/bin/sh -c %s"
+                                                  (shell-quote-argument script))))
+                         (vterm-mode))
+                       (current-buffer)))
+            ("ghostel" (let ((buffer (generate-new-buffer "bench-ghostel")))
+                         ;; Ghostel renders buffers shown in a window only.
+                         (set-window-buffer (selected-window) buffer)
+                         (ghostel-exec buffer "/bin/sh" (list "-c" script))
+                         buffer)))))
+    (with-current-buffer buffer (rename-buffer "bench" t))
+    buffer))
 
 ;;;; The owner's side
 
@@ -385,9 +446,11 @@ made again, as a Markdown renderer redraws."
   (spyglass-bench-owner-cleanup)
   (garbage-collect)
   (let* ((start (float-time))
-         (buffer (if (equal scenario "eat")
-                     (or (spyglass-bench-make-eat (plist-get args :count))
-                         (error "Eat is not available here"))
+         (buffer (if (equal scenario "terminal")
+                     (if (spyglass-bench-terminal-available-p (plist-get args :kind))
+                         (spyglass-bench-make-terminal (plist-get args :kind)
+                                                       (plist-get args :count))
+                       (error "No %s here" (plist-get args :kind)))
                    (get-buffer-create "bench"))))
     ;; Terminals and shells keep no undo; a batch Emacs never trims it.
     (with-current-buffer buffer (setq buffer-undo-list t))
@@ -408,12 +471,18 @@ made again, as a Markdown renderer redraws."
     (setq spyglass-bench--owner
           (plist-put spyglass-bench--owner :subscribed (float-time)))))
 
-(defun spyglass-bench-owner-synced-p ()
-  "Return non-nil when the bench's viewer has everything, acknowledged."
+(defun spyglass-bench-owner-synced-p (&optional sweeps)
+  "Return non-nil when the bench's viewer has everything, acknowledged.
+With SWEEPS, also wait until the share's sweep completed that many
+rounds: changes of overlays alone, far from changed text, are found
+by the sweep."
   (let* ((share (plist-get spyglass-bench--owner :share))
          (buffer (plist-get spyglass-bench--owner :buffer))
          (subs (and share (spyglass-share-subs share))))
     (and subs (buffer-live-p buffer)
+         (or (null sweeps) (null (spyglass-share-mode share))
+             (eq (spyglass-share-mode share) 'direct)
+             (>= (spyglass-share-sweeps share) sweeps))
          (with-current-buffer buffer
            (and (= (buffer-chars-modified-tick) (spyglass-share-chars-tick share))
                 (= (buffer-modified-tick) (spyglass-share-modiff share))
@@ -433,7 +502,7 @@ made again, as a Markdown renderer redraws."
     ("stream" (spyglass-bench-run-stream buffer args done))
     ("term" (spyglass-bench-run-term buffer args done))
     ("overlays" (spyglass-bench-run-overlays buffer args done))
-    ("eat" (let ((timer nil))
+    ("terminal" (let ((timer nil))
              (setq timer (run-with-timer
                           0.05 0.05
                           (lambda ()
@@ -475,12 +544,14 @@ CALLBACK gets the owner's measurements as a plist."
      scenario buffer args
      (lambda ()
        (setq produced (float-time))
-       (let ((timer nil))
+       (let ((timer nil)
+             (sweeps (and (equal scenario "overlays")
+                          (+ 2 (spyglass-share-sweeps share)))))
          (setq timer
                (run-with-timer
                 0.005 0.005
                 (lambda ()
-                  (when (spyglass-bench-owner-synced-p)
+                  (when (spyglass-bench-owner-synced-p sweeps)
                     (cancel-timer timer)
                     (let ((end (float-time)) (gc2 (spyglass-bench-gc)))
                       (funcall

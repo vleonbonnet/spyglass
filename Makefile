@@ -6,8 +6,8 @@
 #
 # EAT_EL is a directory holding eat.el, for the tests and benchmarks of
 # the Eat adapter; without it they are skipped.  GHOSTEL_EL and
-# GHOSTEL_MODULE_DIR locate Ghostel and its native module; VTERM_EL and
-# VTERM_MODULE_DIR vterm's.  BENCH_REMOTE names an SSH host to run the
+# GHOSTEL_MODULE_DIR locate Ghostel's Lisp and its native module;
+# VTERM_EL a directory holding vterm.el and its built module.  BENCH_REMOTE names an SSH host to run the
 # benchmarks against too, through BENCH_SSH.
 
 EMACS ?= emacs
@@ -17,7 +17,6 @@ EAT_EL ?=
 GHOSTEL_EL ?=
 GHOSTEL_MODULE_DIR ?=
 VTERM_EL ?=
-VTERM_MODULE_DIR ?=
 BENCH_REMOTE ?=
 BENCH_SSH ?= ssh
 BENCH_REMOTE_EMACS ?= emacs
@@ -44,7 +43,9 @@ compile:
 	$(BATCH) $(NO_WARNINGS) -f batch-byte-compile $(SOURCES)
 
 test:
-	$(NOPIPE) SPYGLASS_EAT_EL="$(EAT_EL)" $(EMACS_BATCH) -l test/spyglass-test-helpers.el \
+	$(NOPIPE) SPYGLASS_EAT_EL="$(EAT_EL)" SPYGLASS_VTERM_EL="$(VTERM_EL)" \
+	SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
+	$(EMACS_BATCH) -l test/spyglass-test-helpers.el \
 	  $(addprefix -l ,$(TESTS)) -f ert-run-tests-batch-and-exit
 
 lint:
@@ -57,7 +58,7 @@ bench: compile
 	$(NOPIPE) SPYGLASS_EMACS="$(EMACS)" SPYGLASS_TIMEOUT="$(TIMEOUT)" \
 	SPYGLASS_EAT_EL="$(EAT_EL)" SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" \
 	SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
-	SPYGLASS_VTERM_EL="$(VTERM_EL)" SPYGLASS_VTERM_MODULE_DIR="$(VTERM_MODULE_DIR)" \
+	SPYGLASS_VTERM_EL="$(VTERM_EL)" \
 	SPYGLASS_BENCH_REMOTE="$(BENCH_REMOTE)" SPYGLASS_BENCH_SSH="$(BENCH_SSH)" \
 	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" SPYGLASS_BENCH_ONLY="$(BENCH_ONLY)" \
 	$(EMACS_BATCH) -l test/spyglass-bench.el -f spyglass-bench-main

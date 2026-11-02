@@ -109,6 +109,26 @@
   "A face the owner has."
   :group 'spyglass)
 
+(ert-deftest spyglass-e2e-viewer-asks-for-fontification ()
+  "A mirror's redisplay asks the owner to fontify what it shows."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "code.el"
+      (emacs-lisp-mode)
+      (insert "(defun foo ()\n  \"Doc.\"\n  1)\n")
+      ;; Font lock declines batch sessions; this one plays interactive.
+      (let ((noninteractive nil)) (font-lock-mode 1))
+      (should (bound-and-true-p jit-lock-mode))
+      (let ((mirror (spyglass-test-mirror connection (current-buffer))))
+        (spyglass-test-converge (current-buffer) mirror)
+        (should (null (get-text-property 2 'face mirror)))
+        (should (memq #'spyglass--mirror-jit
+                      (buffer-local-value 'jit-lock-functions mirror)))
+        ;; What redisplay of the mirror would do.
+        (with-current-buffer mirror (spyglass--mirror-jit (point-min) (point-max)))
+        (spyglass-test-wait (lambda () (get-text-property 2 'face mirror)))
+        (should (eq (get-text-property 2 'face mirror) 'font-lock-keyword-face))
+        (spyglass-test-converge (current-buffer) mirror)))))
+
 (ert-deftest spyglass-e2e-unknown-face-falls-back ()
   "A face the viewer lacks is replaced by the owner's attributes."
   ;; Both ends are this Emacs: the owner's side computes the attributes,
@@ -524,32 +544,40 @@
                        "127.0.0.1")))
     (spyglass-test-stop)))
 
+(defun spyglass-e2e--terminal (kind)
+  "Check that a terminal of KIND mirrors exactly while a program writes to it."
+  (require 'spyglass-bench-common)
+  (spyglass-bench-read-environment)
+  (unless (spyglass-bench-terminal-available-p kind)
+    (ert-skip (format "No %s here" kind)))
+  (spyglass-test-with-connection connection
+    (let ((buffer (spyglass-bench-make-terminal kind 20000)))
+      (unwind-protect
+          (let ((mirror (spyglass-test-mirror connection buffer)))
+            (spyglass-test-wait (lambda () (not (get-buffer-process buffer))) 60)
+            (spyglass-test-converge buffer mirror 30)
+            (should (with-current-buffer mirror
+                      (save-excursion (goto-char 1) (search-forward "done" nil t))))
+            ;; The adapter's hints spare comparing the whole terminal.
+            (should (< (or (plist-get (spyglass-share-stats (spyglass-share-of buffer))
+                                      :full-scans)
+                           0)
+                       3)))
+        (let ((kill-buffer-query-functions nil))
+          (when (get-buffer-process buffer) (delete-process (get-buffer-process buffer)))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
 (ert-deftest spyglass-e2e-eat ()
   "An Eat terminal mirrors exactly while a program writes to it."
-  (let ((dir (getenv "SPYGLASS_EAT_EL")))
-    (skip-unless (and dir (not (string-empty-p dir))
-                      (file-exists-p (expand-file-name "eat.el" dir))
-                      (executable-find "seq")))
-    (add-to-list 'load-path dir)
-    (require 'eat)
-    (require 'spyglass-eat)
-    (spyglass-test-with-connection connection
-      (let ((buffer (eat-make "spyglass-eat" "/bin/sh" nil "-c"
-                              "sleep 0.5; seq 1 20000; printf '\\033[31mred\\033[0m\\n'; sleep 0.5")))
-        (unwind-protect
-            (let ((mirror (spyglass-test-mirror connection buffer)))
-              (spyglass-test-wait (lambda () (not (get-buffer-process buffer))) 30)
-              (spyglass-test-converge buffer mirror 30)
-              (should (with-current-buffer mirror
-                        (save-excursion (goto-char 1) (search-forward "20000" nil t))))
-              ;; The adapter's hints spare comparing the whole terminal.
-              (should (< (or (plist-get (spyglass-share-stats (spyglass-share-of buffer))
-                                        :full-scans)
-                             0)
-                         3)))
-          (let ((kill-buffer-query-functions nil))
-            (when (get-buffer-process buffer) (delete-process (get-buffer-process buffer)))
-            (kill-buffer buffer)))))))
+  (spyglass-e2e--terminal "eat"))
+
+(ert-deftest spyglass-e2e-vterm ()
+  "A vterm terminal mirrors exactly while a program writes to it."
+  (spyglass-e2e--terminal "vterm"))
+
+(ert-deftest spyglass-e2e-ghostel ()
+  "A Ghostel terminal mirrors exactly while a program writes to it."
+  (spyglass-e2e--terminal "ghostel"))
 
 (provide 'spyglass-e2e-test)
 ;;; spyglass-e2e-test.el ends here

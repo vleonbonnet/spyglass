@@ -61,9 +61,10 @@
            (spyglass-bench-owner-run
             (lambda (result) (spyglass-bench-agent--say (list :id id :result result)))))
           ("open"
-           (when spyglass-bench-eat-dir
-             (add-to-list 'load-path spyglass-bench-eat-dir)
-             (require 'eat))
+           ;; A viewer of terminals has the emulator, and its faces.
+           (when (and (plist-get args :kind)
+                      (spyglass-bench-terminal-available-p (plist-get args :kind)))
+             (spyglass-bench-load-terminal (plist-get args :kind)))
            (let ((buffer (spyglass-bench-viewer-open (car (spyglass-connections)))))
              (spyglass-bench-wait (lambda () (eq (spyglass-mirror-state buffer) 'live)) 60)
              (spyglass-bench-agent--say
@@ -96,8 +97,7 @@ timer: scenarios wait for events, which waiting there would distort."
   "Listen, share the control buffer, and serve the driver until told to quit."
   (setq spyglass-bench-abort-function
         (lambda (msg) (spyglass-bench-agent--say (list :abort msg))))
-  (setq spyglass-bench-eat-dir (let ((d (getenv "SPYGLASS_EAT_EL")))
-                                 (and d (not (string-empty-p d)) d)))
+  (spyglass-bench-read-environment)
   (add-hook 'spyglass-error-functions
             (lambda (_c msg) (spyglass-bench-agent--say (list :warning msg))))
   (spyglass-bench-start-guard)
