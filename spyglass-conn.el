@@ -62,6 +62,15 @@ After the last, attempts repeat at its delay until
   :group 'spyglass
   :type '(repeat number))
 
+(defcustom spyglass-send-queue-limit (* 64 1024 1024)
+  "Bytes of frames that may wait for a stream while a write on it waits.
+Frames sent while a write waits, answers to what the peer sends among
+them, are queued (see `spyglass--send-frame'); a peer making the
+queue grow past this reads nothing, and its stream is dropped.  Keep
+it above `spyglass-window': resuming may queue that much."
+  :group 'spyglass
+  :type 'natnum)
+
 (defcustom spyglass-handshake-timeout 20.0
   "Seconds a new stream may take to complete the handshake."
   :group 'spyglass
@@ -192,28 +201,88 @@ Return the number of bytes sent, or nil when the stream is gone."
       (let ((frame (spyglass-wire-frame header payload)))
         (spyglass--send-frame connection frame)))))
 
+(cl-defstruct (spyglass--writer (:constructor spyglass--make-writer)
+                               (:copier nil))
+  "Frames waiting for a stream while a write on it waits."
+  (head nil :documentation "Frames queued, oldest first, as (FRAME . SIZE).")
+  (tail nil :documentation "The last cons of the queue.")
+  (bytes 0 :documentation "Bytes queued."))
+
+(defun spyglass--writing-p (connection)
+  "Return non-nil while a frame is being written on CONNECTION's stream.
+Frames sent meanwhile wait in a queue: see `spyglass--send-frame'."
+  (let ((process (spyglass-connection-process connection)))
+    (and process (process-get process 'spyglass-writer) t)))
+
 (defun spyglass--send-frame (connection frame &optional quiet)
   "Send FRAME, a unibyte string or a list of them, on CONNECTION's stream.
-Return its length, or nil when the stream is gone.  A failure is
-reported unless QUIET."
+Return its length, or nil when the stream is gone or the write failed.
+A failure is reported unless QUIET.
+
+Every frame goes through here, whole and in order.  A write the
+stream cannot take at once makes Emacs wait inside
+`process-send-string', running timers and process filters: a frame
+they sent then would go between the parts of the frame being written.
+It is queued instead, and written right after that frame by the same
+call, not by a timer.  Senders that may send much, as owners'
+updates and channels, rather wait while `spyglass--writing-p'."
   (let ((process (spyglass-connection-process connection)))
     (when (process-live-p process)
-      (condition-case err
-          (if (stringp frame)
-              (progn
-                (process-send-string process frame)
+      (let ((size (if (stringp frame) (length frame) (apply #'+ (mapcar #'length frame))))
+            (writer (process-get process 'spyglass-writer)))
+        (if writer
+            (spyglass--enqueue connection writer frame size)
+          (spyglass--write connection process frame size quiet))))))
+
+(defun spyglass--enqueue (connection writer frame size)
+  "Queue FRAME, SIZE bytes, in WRITER, CONNECTION's stream's queue.
+Return SIZE.  Past `spyglass-send-queue-limit', the peer reads nothing
+of what it sends us answers to: drop the stream and return nil."
+  (if (> (+ (spyglass--writer-bytes writer) size) spyglass-send-queue-limit)
+      (progn
+        (spyglass--report connection "%s reads too slowly: %d bytes wait to be sent"
+                          (spyglass-connection-label connection)
+                          (+ (spyglass--writer-bytes writer) size))
+        (spyglass--drop connection)
+        nil)
+    (let ((cell (list (cons frame size))))
+      (if (spyglass--writer-tail writer)
+          (setcdr (spyglass--writer-tail writer) cell)
+        (setf (spyglass--writer-head writer) cell))
+      (setf (spyglass--writer-tail writer) cell)
+      (cl-incf (spyglass--writer-bytes writer) size)
+      size)))
+
+(defun spyglass--write (connection process frame size quiet)
+  "Write FRAME, SIZE bytes, on PROCESS, CONNECTION's stream; then its queue.
+Return SIZE once FRAME is written, or nil when its write failed,
+reported unless QUIET.  Frames queued meanwhile are written after it;
+a failure drops them, the stream being broken."
+  (let ((writer (spyglass--make-writer))
+        (written nil))
+    (process-put process 'spyglass-writer writer)
+    (unwind-protect
+        (condition-case err
+            (let ((next (cons frame size)))
+              (while next
+                (if (stringp (car next))
+                    (process-send-string process (car next))
+                  (dolist (part (car next))
+                    (process-send-string process part)))
                 (setf (spyglass-connection-last-send connection) (float-time))
-                (length frame))
-            (let ((n 0))
-              (dolist (part frame)
-                (process-send-string process part)
-                (setq n (+ n (length part))))
-              (setf (spyglass-connection-last-send connection) (float-time))
-              n))
-        (error
-         (unless quiet
-           (spyglass--report connection "Sending failed: %s" (error-message-string err)))
-         nil)))))
+                (unless written (setq written size))
+                (setq next (pop (spyglass--writer-head writer)))
+                (when next
+                  (unless (spyglass--writer-head writer)
+                    (setf (spyglass--writer-tail writer) nil))
+                  (cl-decf (spyglass--writer-bytes writer) (cdr next)))))
+          (error
+           ;; A stream deleted on purpose meanwhile fails quietly.
+           (unless (or (and quiet (not written))
+                       (not (eq process (spyglass-connection-process connection))))
+             (spyglass--report connection "Sending failed: %s" (error-message-string err)))))
+      (process-put process 'spyglass-writer nil))
+    written))
 
 (defun spyglass--request (connection op callback &rest args)
   "Send request OP with ARGS, a plist, to CONNECTION's peer.

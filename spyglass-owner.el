@@ -1235,11 +1235,13 @@ be built makes SUB start over; a snapshot that cannot either ends it."
         nil)))))
 
 (defvar spyglass--sending nil
-  "Non-nil while frames are being sent.
+  "Non-nil while updates are being sent.
 A write the stream cannot take at once makes Emacs wait, running
 timers and process filters meanwhile: they may change shared buffers
-and acknowledge frames, but must not send, lest captures and sends
-interleave.  They schedule a flush instead.")
+and acknowledge frames, but must not flush, lest captures and sends
+interleave.  They schedule a flush instead.  Other frames they send,
+answers and acknowledgments, the connection queues behind the frame
+being written (see `spyglass--send-frame').")
 
 (defun spyglass--captured-p (share)
   "Return non-nil when SHARE's buffer has not changed since its capture."
@@ -1265,7 +1267,10 @@ just captured."
             (throw 'done nil))
           (setq first nil)
           ;; Sending may have let the buffer change: capture again first.
-          (unless (spyglass--captured-p share)
+          ;; A write waiting on the stream, of a frame sent by a timer
+          ;; or filter, would queue this one: updates are never queued.
+          (when (or (not (spyglass--captured-p share))
+                    (spyglass--writing-p connection))
             (spyglass--schedule-flush)
             (throw 'done nil))
           (let ((built (spyglass--sub-frame sub)))

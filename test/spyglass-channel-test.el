@@ -32,14 +32,6 @@
 (defvar spyglass-channel-test--events nil
   "Attach and detach events of the test channel, newest first.")
 
-(defun spyglass-channel-test--server-end (client)
-  "Return the connection the server accepted for CLIENT, the other end."
-  (cl-find-if (lambda (c) (and (spyglass-connection-server c)
-                               (equal (spyglass-connection-peer-id c) spyglass-instance-id)
-                               (not (eq c client))
-                               (spyglass-connection-live-p c)))
-              (spyglass-connections)))
-
 (defmacro spyglass-channel-test--with (vars &rest body)
   "Run BODY with VARS, (CLIENT SERVER), the two ends of a connection to itself.
 The channel \"test\" is registered meanwhile, its messages going to
@@ -58,7 +50,7 @@ The channel \"test\" is registered meanwhile, its messages going to
          (spyglass-test-with-connection ,(car vars)
            (let ((,(cadr vars) nil))
              (spyglass-test-wait (lambda () (setq ,(cadr vars)
-                                                  (spyglass-channel-test--server-end ,(car vars)))))
+                                                  (spyglass-test-other-end ,(car vars)))))
              (should ,(cadr vars))
              ,@body))
        (spyglass-unregister-channel "test"))))

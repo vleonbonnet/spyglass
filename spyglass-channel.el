@@ -46,8 +46,6 @@
 (require 'spyglass-wire)
 (require 'spyglass-conn)
 
-(defvar spyglass--sending)
-
 (defcustom spyglass-channel-chunk-size (* 256 1024)
   "Largest message, in bytes of JSON, sent in one frame; larger ones go in chunks."
   :group 'spyglass
@@ -246,14 +244,14 @@ against `spyglass-channel-window' until acknowledged."
 (defun spyglass--channel-pump (connection)
   "Send what CONNECTION's queue may send now, for a tick at most.
 Control frames go first, then the queue in order; a chunk waits while
-the window is full.  While spyglass writes a frame of several parts,
-nothing is written: a write waiting lets timers and filters run, and a
-frame written then would go between the parts."
+the window is full.  While a write waits on the stream, nothing is
+sent: the connection would queue it apart from this queue, out of the
+window's reach."
   (let ((link (spyglass--link connection)))
     (cond
      ((not (spyglass-channel-available-p connection))
       (spyglass--link-reset connection))
-     ((bound-and-true-p spyglass--sending)
+     ((spyglass--writing-p connection)
       (spyglass--channel-schedule connection 0.001))
      (t
       (let ((deadline (+ (float-time) spyglass-channel-tick-budget))

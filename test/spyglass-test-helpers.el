@@ -155,6 +155,14 @@ NAME labels the connection."
     (should (spyglass-connection-live-p connection))
     connection))
 
+(defun spyglass-test-other-end (connection)
+  "Return the connection the server accepted for CONNECTION, its other end."
+  (cl-find-if (lambda (c) (and (spyglass-connection-server c)
+                               (equal (spyglass-connection-peer-id c) spyglass-instance-id)
+                               (not (eq c connection))
+                               (spyglass-connection-live-p c)))
+              (spyglass-connections)))
+
 (defmacro spyglass-test-with-connection (var &rest body)
   "Run BODY with VAR bound to a connection of this Emacs to itself."
   (declare (indent 1) (debug (symbolp body)))
