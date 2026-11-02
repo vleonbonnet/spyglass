@@ -483,7 +483,11 @@ Updates are ignored until the snapshot comes."
                  ""))
          (styles (spyglass--mirror-styles mirror))
          (offset 0))
-    (when (plist-get header :sr) (clrhash styles))
+    ;; An owner resets styles past `spyglass-max-styles'; one that does
+    ;; not may not make this table grow without bound.
+    (when (or (plist-get header :sr)
+              (> (hash-table-count styles) (* 2 spyglass-max-styles)))
+      (clrhash styles))
     (seq-doseq (def (or (plist-get header :fd) []))
       (when (and (vectorp def) (= (length def) 2) (stringp (aref def 0)))
         (let ((attrs (spyglass-wire-sanitize-face (spyglass-wire-decode (aref def 1)))))

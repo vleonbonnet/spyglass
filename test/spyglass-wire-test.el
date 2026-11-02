@@ -145,6 +145,13 @@
   (should (equal (spyglass-wire-decode (list :S "abc" :p [[0 9 [(:y "face") (:y "bold")]]]))
                  "abc")))
 
+(ert-deftest spyglass-wire-plain-strings ()
+  "Strings JSON cannot carry are made safe."
+  (should (equal (spyglass-wire-plain-string (propertize "abc" 'face 'bold)) "abc"))
+  (let ((s (spyglass-wire-plain-string (string ?a #x3fff80 #xd800 ?é))))
+    (should (equal s (string ?a #xfffd #xfffd ?é)))
+    (should (json-serialize s))))
+
 (ert-deftest spyglass-wire-tokens ()
   "Tokens are random and compared exactly."
   (let ((a (spyglass-wire-random-token)) (b (spyglass-wire-random-token)))

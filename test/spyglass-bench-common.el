@@ -376,7 +376,11 @@ made again, as a Markdown renderer redraws."
   "Directory of Ghostel's native module, or nil.")
 
 (defun spyglass-bench-read-environment ()
-  "Locate the terminal emulators from the environment, as the Makefile sets it."
+  "Locate the terminal emulators from the environment, as the Makefile sets it.
+SPYGLASS_BENCH_WINDOW, if set, is `spyglass-window' in bytes."
+  (let ((window (getenv "SPYGLASS_BENCH_WINDOW")))
+    (when (and window (not (string-empty-p window)))
+      (setq spyglass-window (string-to-number window))))
   (cl-flet ((dir (name) (let ((d (getenv name))) (and d (not (string-empty-p d)) d))))
     (setq spyglass-bench-eat-dir (dir "SPYGLASS_EAT_EL")
           spyglass-bench-vterm-dir (dir "SPYGLASS_VTERM_EL")
@@ -390,6 +394,9 @@ made again, as a Markdown renderer redraws."
          ("eat" spyglass-bench-eat-dir)
          ("vterm" spyglass-bench-vterm-dir)
          ("ghostel" (and spyglass-bench-ghostel-dir spyglass-bench-ghostel-module-dir)))))
+
+(defvar vterm-kill-buffer-on-exit)
+(defvar ghostel-kill-buffer-on-exit)
 
 (defun spyglass-bench-load-terminal (kind)
   "Load the terminal emulator KIND and its adapter."
@@ -412,8 +419,6 @@ made again, as a Markdown renderer redraws."
 (declare-function vterm-mode "vterm" ())
 (declare-function ghostel-exec "ghostel" (buffer program &optional args identity))
 (defvar vterm-shell)
-(defvar vterm-kill-buffer-on-exit)
-(defvar ghostel-kill-buffer-on-exit)
 
 (defun spyglass-bench-make-terminal (kind count)
   "Return a new terminal of KIND printing 1 to COUNT, in colors, then exiting."

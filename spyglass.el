@@ -42,7 +42,7 @@
 ;;   (setq c (spyglass-connect (spyglass-ssh-transport "host")))
 ;;   (spyglass-open c "*shell*")        ; returns the mirror's buffer
 ;;
-;; or interactively: `spyglass-share-buffer', `spyglass-server-start',
+;; or interactively: `spyglass-share-current-buffer', `spyglass-start-server',
 ;; `spyglass-connect-host' and `spyglass-open-share'.  See README.org
 ;; for the API and doc/design.org for the protocol.
 
@@ -65,7 +65,7 @@
 ;;;; Commands
 
 ;;;###autoload
-(defun spyglass-share-buffer (&optional read-only)
+(defun spyglass-share-current-buffer (&optional read-only)
   "Share the current buffer; with prefix argument READ-ONLY, refuse input.
 Starts the server if it does not run."
   (interactive "P")
@@ -77,7 +77,7 @@ Starts the server if it does not run."
            (spyglass-server-port (spyglass-server))))
 
 ;;;###autoload
-(defun spyglass-unshare-buffer ()
+(defun spyglass-unshare-current-buffer ()
   "Stop sharing the current buffer."
   (interactive)
   (spyglass-unshare (current-buffer)))

@@ -55,6 +55,11 @@
 
 (require 'spyglass-bench-common)
 
+(declare-function profiler-reset "profiler" ())
+(declare-function profiler-report "profiler" ())
+(declare-function profiler-report-render-reversed-calltree "profiler" ())
+(declare-function profiler-report-expand-entry "profiler" (&optional full))
+
 (defvar spyglass-bench--agent nil
   "Process of the agent.")
 
@@ -169,8 +174,9 @@
                  :name "agent" :connection-type 'pipe :noquery t
                  :command (list (spyglass-bench--ssh) "-o" "BatchMode=yes"
                                 spyglass-bench--remote
-                                (format "cd %s && exec timeout %s %s -Q --batch -L . -l spyglass-bench-agent.el -f spyglass-bench-agent-main"
-                                        dir timeout emacs))
+                                (format "cd %s && SPYGLASS_BENCH_WINDOW=%s exec timeout %s %s -Q --batch -L . -l spyglass-bench-agent.el -f spyglass-bench-agent-main"
+                                        dir (or (getenv "SPYGLASS_BENCH_WINDOW") "")
+                                        timeout emacs))
                  :filter #'spyglass-bench--agent-filter)))
       (let ((dir (make-temp-file "spyglass-bench-" t))
             (root default-directory))

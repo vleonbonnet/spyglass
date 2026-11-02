@@ -103,5 +103,17 @@ Intervals are applied from the last, as the owner sends them."
           (should-error (spyglass-share (current-buffer) :id "same"))))
     (spyglass-test-stop)))
 
+(ert-deftest spyglass-owner-accessors-are-not-shadowed ()
+  "No function of spyglass takes the name of a structure's accessor."
+  (dolist (type '(spyglass-share spyglass--sub spyglass-connection spyglass-server
+                                 spyglass-mirror))
+    (dolist (slot (cdr (cl-struct-slot-info type)))
+      (let* ((conc (pcase type
+                     ('spyglass-mirror "spyglass--mirror-")
+                     (_ (format "%s-" type))))
+             (accessor (intern (format "%s%s" conc (car slot)))))
+        (should (string-prefix-p "Access slot"
+                                 (or (documentation accessor t) "")))))))
+
 (provide 'spyglass-owner-test)
 ;;; spyglass-owner-test.el ends here

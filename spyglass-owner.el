@@ -104,10 +104,11 @@ Larger buffers are captured through modification hooks alone."
   :group 'spyglass
   :type 'natnum)
 
-(defcustom spyglass-window (* 1024 1024)
+(defcustom spyglass-window (* 4 1024 1024)
   "Bytes sent to a viewer and not yet acknowledged, past which sending waits.
-Kept near what a socket or pipe buffers, so that writes seldom wait:
-while a write waits, Emacs reads no keyboard input."
+It bounds throughput to a window per round trip: 4 MB carry 50 MB/s
+over SSH on a local network.  Larger windows let writes wait more
+often, and while a write waits Emacs reads no keyboard input."
   :group 'spyglass
   :type 'natnum)
 
@@ -127,11 +128,6 @@ the next flush, at once."
   "Seconds a subscription waits for its viewer to come back."
   :group 'spyglass
   :type 'number)
-
-(defcustom spyglass-max-styles 8192
-  "Most distinct property sets remembered per viewer before starting over."
-  :group 'spyglass
-  :type 'natnum)
 
 (defcustom spyglass-text-properties '(face invisible display line-prefix wrap-prefix)
   "Text properties mirrored, among `spyglass-wire-text-properties'.
@@ -953,8 +949,9 @@ off; polling captures again later."
                      (condition-case nil
                          (format-mode-line header-line-format nil nil (current-buffer))
                        (error nil)))))
-    (list :name (buffer-name)
-          :mode (condition-case nil (format-mode-line mode-name) (error ""))
+    (list :name (spyglass-wire-plain-string (buffer-name))
+          :mode (spyglass-wire-plain-string
+                 (condition-case nil (format-mode-line mode-name) (error "")))
           :tw tab-width :tl (if truncate-lines t :false)
           :ww (if word-wrap t :false)
           :inv (spyglass--invisibility-spec)
@@ -1195,7 +1192,7 @@ no mirrored property.  ACC collects new definitions, see
 (defun spyglass--sub-frame (sub)
   "Return SUB's next frame as (PARTS . CHANGE-TIME), or nil if none is due.
 PARTS are the frame's strings, sent in order.  A frame that cannot
-be built makes SUB start over."
+be built makes SUB start over; a snapshot that cannot either ends it."
   (condition-case err
       (let ((built (spyglass--build-frame sub)))
         (when built
@@ -1207,8 +1204,13 @@ be built makes SUB start over."
                        (spyglass-share-id (spyglass--sub-share sub))
                        (error-message-string err))
      (spyglass--sub-restart sub)
-     (let ((built (spyglass--build-frame sub)))
-       (and built (cons (spyglass-wire-frame-parts (car built) (cdr built)) nil))))))
+     (condition-case err
+         (let ((built (spyglass--build-frame sub)))
+           (and built (cons (spyglass-wire-frame-parts (car built) (cdr built)) nil)))
+       (error
+        ;; Even a snapshot fails: give up on this viewer.
+        (spyglass--sub-free sub (format "cannot send: %s" (error-message-string err)))
+        nil)))))
 
 (defvar spyglass--sending nil
   "Non-nil while frames are being sent.
@@ -1528,10 +1530,11 @@ just captured."
    (mapcar (lambda (share)
              (let ((buffer (spyglass-share-buffer share)))
                (list :id (spyglass-share-id share)
-                     :name (buffer-name buffer)
-                     :mode (with-current-buffer buffer
-                             (condition-case nil (format-mode-line mode-name)
-                               (error "")))
+                     :name (spyglass-wire-plain-string (buffer-name buffer))
+                     :mode (spyglass-wire-plain-string
+                            (with-current-buffer buffer
+                              (condition-case nil (format-mode-line mode-name)
+                                (error ""))))
                      :size (buffer-size buffer)
                      :input (if (spyglass-share-read-only share) :false t))))
            (reverse (cl-remove-if-not (lambda (s) (buffer-live-p (spyglass-share-buffer s)))
@@ -1696,7 +1699,7 @@ Mirrors cannot be shared."
             (when read-only-p (setf (spyglass-share-read-only share) read-only))
             (when input-p (setf (spyglass-share-input share) input))
             (when capture-p (setf (spyglass-share-capture share) capture)))
-        (let ((id (or id (buffer-name buffer))))
+        (let ((id (spyglass-wire-plain-string (or id (buffer-name buffer)))))
           (when (spyglass--share-by-id id)
             (error "A share named %s exists" id))
           (setq share (spyglass--make-share :id id :buffer buffer :read-only read-only

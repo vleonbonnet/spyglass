@@ -21,6 +21,7 @@ BENCH_REMOTE ?=
 BENCH_SSH ?= ssh
 BENCH_REMOTE_EMACS ?= emacs
 BENCH_ONLY ?=
+BENCH_WINDOW ?=
 
 # Stale byte code must never shadow an edited source, in builds or tests.
 PREFER_NEWER = --eval '(setq load-prefer-newer t)'
@@ -61,6 +62,7 @@ bench: compile
 	SPYGLASS_VTERM_EL="$(VTERM_EL)" \
 	SPYGLASS_BENCH_REMOTE="$(BENCH_REMOTE)" SPYGLASS_BENCH_SSH="$(BENCH_SSH)" \
 	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" SPYGLASS_BENCH_ONLY="$(BENCH_ONLY)" \
+	SPYGLASS_BENCH_WINDOW="$(BENCH_WINDOW)" \
 	$(EMACS_BATCH) -l test/spyglass-bench.el -f spyglass-bench-main
 
 clean:

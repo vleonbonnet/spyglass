@@ -27,7 +27,7 @@ It is a library: it knows nothing of what the buffers hold. A session manager su
   (spyglass-share (get-buffer "*shell*"))
 #+end_src
 
-The server listens on 127.0.0.1 only and writes its port and a random token to =spyglass-registration-file= (=~/.emacs.d/spyglass/server.json=), readable by you alone. Interactively, =M-x spyglass-share-buffer= starts the server and shares the current buffer.
+The server listens on 127.0.0.1 only and writes its port and a random token to =spyglass-registration-file= (=~/.emacs.d/spyglass/server.json=), readable by you alone. Interactively, =M-x spyglass-share-current-buffer= starts the server and shares the current buffer.
 
 ** On the viewer
 

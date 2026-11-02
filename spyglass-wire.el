@@ -55,6 +55,10 @@ far below it: updates are split into frames of
 `spyglass-frame-chars' characters."
   :type 'natnum)
 
+(defcustom spyglass-max-styles 8192
+  "Most distinct property sets remembered per viewer before starting over."
+  :type 'natnum)
+
 (defconst spyglass-wire-handshake-frame-size (* 64 1024)
   "Largest frame accepted before a peer has authenticated.")
 
@@ -231,6 +235,17 @@ the stream cannot be trusted after that."
       (or (spyglass-wire--ascii-p string)
           (condition-case nil (and (json-serialize string) t) (error nil)))
     (spyglass-wire--ascii-p string)))
+
+(defun spyglass-wire-plain-string (string)
+  "Return STRING without properties, as JSON can carry it.
+Characters JSON cannot carry, raw bytes and surrogates, become U+FFFD."
+  (let ((plain (substring-no-properties string)))
+    (if (spyglass-wire--json-string-p plain)
+        plain
+      (apply #'string
+             (mapcar (lambda (c)
+                       (if (or (> c #x10ffff) (<= #xd800 c #xdfff)) #xfffd c))
+                     (string-to-multibyte plain))))))
 
 (defun spyglass-wire-encode (value &optional depth)
   "Return VALUE as data `json-serialize' accepts.
