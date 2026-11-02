@@ -53,6 +53,7 @@
 (require 'spyglass-owner)
 (require 'spyglass-window)
 (require 'spyglass-mirror)
+(require 'spyglass-channel)
 
 (with-eval-after-load 'eat
   (require 'spyglass-eat))

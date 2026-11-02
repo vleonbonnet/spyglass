@@ -69,6 +69,17 @@ Nothing below prompts; every function returns at once, and what happens on the n
 - Transports: =(spyglass-ssh-transport HOST &key PROGRAM FILE ARGS)=, =(spyglass-file-transport &optional FILE)= for this host, =(spyglass-tcp-transport HOST PORT TOKEN)=. A transport is any function called with a continuation DONE, which it calls with a process streaming to the peer's server and the token, or with nil and a message; drover can supply its own.
 - =(spyglass-disconnect CONNECTION)=, =(spyglass-connections)=, =(spyglass-connection-state CONNECTION)= (=connecting=, =open=, =reconnecting=, =closed=), =(spyglass-connection-shares CONNECTION)=, =(spyglass-list-shares CONNECTION CALLBACK)=, =(spyglass-connection-label CONNECTION)=, =(spyglass-connection-capable-p CONNECTION CAPABILITY)=.
 - =spyglass-connection-state-functions=, =spyglass-shares-changed-functions=, =spyglass-error-functions= :: Hooks on every connection's state, a peer's shares, and errors.
+- =spyglass-connection-attach-functions=, =spyglass-connection-detach-functions= :: Hooks run with a connection as each stream's handshake succeeds, and with (CONNECTION FINAL) as a stream ends, FINAL non-nil when the connection will not come back.
+- =(spyglass-connection-set-heartbeat CONNECTION INTERVAL TIMEOUT)= :: Heartbeats of one connection: every INTERVAL seconds of silence, the peer dropped after TIMEOUT, instead of =spyglass-heartbeat-interval= and =spyglass-heartbeat-timeout=.
+
+** Channels
+
+Applications built on spyglass talk over its connections through channels: named streams of messages, each message a JSON object. Peers announce channels as a capability (=ch=): a peer of the same protocol version predating them gets nothing on channels, and =(spyglass-channel-available-p CONNECTION)= tells whether a connection's peer handles them.
+
+- =(spyglass-register-channel NAME HANDLER &key REQUEST ATTACH DETACH)= :: HANDLER gets =(CONNECTION MESSAGE)= for each message; REQUEST =(CONNECTION MESSAGE REPLY)= for each request, and calls REPLY once, now or later, with an answer or with nil and an error; ATTACH and DETACH hear the streams of connections whose peers handle channels open and end, as the hooks above.  =(spyglass-unregister-channel NAME)=.
+- =(spyglass-channel-send CONNECTION NAME MESSAGE)= :: MESSAGE is a plist as =json-serialize= takes it (objects as plists, arrays as vectors, =:false=, nil as null); text JSON cannot carry, raw bytes or surrogates, is replaced by U+FFFD.  It arrives as =json-parse-string= returns it, never given to =read=.  Messages go in order while the stream lives; those queued when it breaks are dropped.
+- =(spyglass-channel-request CONNECTION NAME MESSAGE CALLBACK &optional TIMEOUT)= :: CALLBACK gets =(REPLY ERROR)= once: the answer, or a message when the peer refused, no channel answers there, the time ran out (=spyglass-channel-request-timeout=) or the stream ended first.
+- Large messages :: Past =spyglass-channel-chunk-size= (256 KB) a message goes in chunks, at most =spyglass-channel-window= (1 MB) of them unacknowledged, sent from timers in ticks of =spyglass-channel-tick-budget=; none may exceed =spyglass-channel-max-size= (32 MB), on either end.  =(spyglass-channel-stats CONNECTION)= counts messages, bytes and chunks.
 
 ** Mirrors
 

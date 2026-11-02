@@ -48,11 +48,12 @@
   "Version of the protocol spoken on the wire.
 Peers whose major version differs refuse each other at the handshake.")
 
-(defconst spyglass-wire-capabilities '("sz")
+(defconst spyglass-wire-capabilities '("sz" "ch")
   "Optional messages this version handles, announced in its hello.
 A peer sends such a message only to peers announcing it, so that
 peers of the same protocol version but older work together: \"sz\",
-the size of the windows showing a mirror.")
+the size of the windows showing a mirror; \"ch\", the messages of
+channels and their acknowledgments (\"ch\" and \"cha\").")
 
 (defcustom spyglass-max-frame-size (* 64 1024 1024)
   "Largest frame, header and payload together, accepted from a peer.
