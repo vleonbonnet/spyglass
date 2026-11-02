@@ -55,6 +55,18 @@
 ;; driver's mirror learning it back when the agent owns; `exact' says
 ;; each size was reached (sN for N sizes) besides the digests.
 ;;
+;; Scenarios marked with chatter have both ends ping each other and
+;; send small channel messages every 2 ms throughout, so that writes
+;; waiting on the stream meet frames sent by timers and filters; "bN"
+;; in `exact' counts the stream's breaks, which only the reconnect
+;; scenario should have.
+;;
+;; The channels scenario has each end send messages on a channel to
+;; the other at once: the owner's column is the side sending the
+;; larger set.  Its time runs until both ends received everything, its
+;; latency is the small messages', one way and back, and `exact' says
+;; both sets arrived in order with their digests.
+;;
 ;; BENCH_ONLY, a space-separated list of scenario names, restricts the
 ;; run.  Every Emacs kills itself past 2 GB of resident memory.
 
@@ -93,6 +105,9 @@
 
 (defvar spyglass-bench--remote nil
   "Host of the agent, or nil for this one.")
+
+(defvar spyglass-bench--breaks 0
+  "Times the connection's stream broke during the current scenario.")
 
 (defvar spyglass-bench--remote-dir nil
   "Directory of the agent on its host.")
@@ -278,7 +293,17 @@
            ("ghostel-seq-300k" "terminal" (:kind "ghostel" :count 300000)
             (:terminal "ghostel"))
            ("reconnect-appends" "appends" (:count 100000) (:drops 3))
-           ("resize" "resize" nil (:resize t))))
+           ("resize" "resize" nil (:resize t))
+           ("resize-chatter" "resize" nil (:resize t :chatter 0.002))
+           ("large-10M-4MB-frames" "large" (:size 10000000 :frame-chars 4000000) nil)
+           ("large-10M-4MB-frames-chatter" "large" (:size 10000000 :frame-chars 4000000)
+            (:chatter 0.002))
+           ("stream-50MB/s-chatter" "stream" (:rate 50000000 :seconds 4 :keep 8000000)
+            (:chatter 0.002))
+           ("channels" "channels"
+            (:forward (:small 2000 :large 8 :size 4000000)
+                      :back (:small 2000 :large 2 :size 4000000))
+            (:channels t))))
         (only (spyglass-bench--getenv "SPYGLASS_BENCH_ONLY")))
     (if only
         (let ((names (split-string only)))
@@ -315,12 +340,14 @@
     (spyglass-bench-load-terminal (plist-get options :terminal)))
   (let ((prepared (spyglass-bench--command "prepare" :scenario scenario
                                            :args (spyglass-bench--json-args args))))
+    (spyglass-bench--chatter (plist-get options :chatter))
     (let ((mirror (spyglass-bench-viewer-open spyglass-bench--connection)))
       (spyglass-bench-wait (lambda () (eq (spyglass-mirror-state mirror) 'live)) 120)
       (when (plist-get options :drops) (spyglass-bench--drops (plist-get options :drops)))
       (let* ((owner (prog1 (spyglass-bench--command "run") (spyglass-bench--cancel-drops)))
              (_ (spyglass-bench-wait (lambda () (eq (spyglass-mirror-state mirror) 'live)) 60))
              (viewer (spyglass-bench-viewer-result)))
+        (spyglass-bench--chatter nil)
         (spyglass-bench-viewer-cleanup)
         (spyglass-bench--command "cleanup")
         (list :prepared prepared :owner owner :viewer viewer)))))
@@ -328,6 +355,7 @@
 (defun spyglass-bench--driver-owns (scenario args options)
   "Play SCENARIO with ARGS and OPTIONS, the driver owning; return measurements."
   (let* ((prepared (spyglass-bench-owner-prepare scenario args)))
+    (spyglass-bench--chatter (plist-get options :chatter))
     (apply #'spyglass-bench--command "open"
            (and (plist-get options :terminal)
                 (list :args (list :kind (plist-get options :terminal)))))
@@ -339,9 +367,15 @@
       (unless owner (error "The scenario did not finish"))
       (spyglass-bench-wait (lambda () (spyglass-connection-live-p spyglass-bench--connection)) 60)
       (let ((viewer (spyglass-bench--command "result")))
+        (spyglass-bench--chatter nil)
         (spyglass-bench--command "cleanup")
         (spyglass-bench-owner-cleanup)
         (list :prepared prepared :owner owner :viewer viewer)))))
+
+(defun spyglass-bench--chatter (interval)
+  "Have both ends chatter every INTERVAL seconds; nil stops."
+  (spyglass-bench-chatter spyglass-bench--connection interval)
+  (spyglass-bench--command "chatter" :args (list :interval (or interval 0))))
 
 ;;;; Resizing
 
@@ -358,11 +392,12 @@ ends; MATCHED is non-nil when every size was reached."
           :total (apply #'+ latencies)
           :p50 (nth (/ (length sorted) 2) sorted) :max (car (last sorted)))))
 
-(defun spyglass-bench--agent-owns-resize (args)
-  "Play the resize scenario with ARGS, the agent owning and the driver viewing."
+(defun spyglass-bench--agent-owns-resize (args options)
+  "Play the resize scenario with ARGS and OPTIONS, the agent owning."
   (let ((prepared (spyglass-bench--command "prepare" :scenario "resize"
                                            :args (spyglass-bench--json-args args)))
         (latencies nil) (matched t))
+    (spyglass-bench--chatter (plist-get options :chatter))
     (let* ((mirror (spyglass-bench-viewer-open spyglass-bench--connection))
            (state (buffer-local-value 'spyglass--mirror mirror)))
       (spyglass-bench-wait (lambda () (and (eq (spyglass-mirror-state mirror) 'live)
@@ -378,17 +413,19 @@ ends; MATCHED is non-nil when every size was reached."
       (delete-other-windows)
       (let* ((owner (spyglass-bench--command "run"))
              (viewer (spyglass-bench-viewer-result)))
+        (spyglass-bench--chatter nil)
         (spyglass-bench-viewer-cleanup)
         (spyglass-bench--command "cleanup")
         (list :prepared prepared
               :owner (plist-put owner :resize (spyglass-bench--resize-result latencies matched))
               :viewer viewer)))))
 
-(defun spyglass-bench--driver-owns-resize (args)
-  "Play the resize scenario with ARGS, the driver owning and the agent viewing."
+(defun spyglass-bench--driver-owns-resize (args options)
+  "Play the resize scenario with ARGS and OPTIONS, the driver owning."
   (let* ((prepared (spyglass-bench-owner-prepare "resize" args))
          (share (plist-get spyglass-bench--owner :share))
          (latencies nil) (matched t))
+    (spyglass-bench--chatter (plist-get options :chatter))
     (spyglass-bench--command "open")
     (dolist (size spyglass-bench--sizes)
       (let* ((start (float-time))
@@ -402,11 +439,68 @@ ends; MATCHED is non-nil when every size was reached."
       (spyglass-bench-owner-run (lambda (result) (setq owner result)))
       (spyglass-bench-wait (lambda () owner) 120)
       (let ((viewer (spyglass-bench--command "result")))
+        (spyglass-bench--chatter nil)
         (spyglass-bench--command "cleanup")
         (spyglass-bench-owner-cleanup)
         (list :prepared prepared
               :owner (plist-put owner :resize (spyglass-bench--resize-result latencies matched))
               :viewer viewer)))))
+
+;;;; Channels
+
+(defun spyglass-bench--channels (direction args)
+  "Play the channels scenario with ARGS; DIRECTION's end sends the larger set.
+Both ends send at once; return the measurements of both."
+  (let* ((forward (plist-get args :forward))
+         (back (plist-get args :back))
+         (agent-sends (if (eq direction 'agent) forward back))
+         (driver-sends (if (eq direction 'agent) back forward))
+         (connection spyglass-bench--connection))
+    (spyglass-bench-channel-reset connection)
+    (spyglass-bench--command "chan-reset")
+    (let* ((start (float-time))
+           (to-driver (spyglass-bench--command "chan-send" :args agent-sends))
+           (to-agent (spyglass-bench-channel-send connection driver-sends))
+           (agent nil))
+      (spyglass-bench-wait
+       (lambda ()
+         (and (>= (plist-get spyglass-bench--channel :count) (plist-get to-driver :count))
+              (progn
+                (setq agent (spyglass-bench--command "chan-result"))
+                (or (>= (plist-get agent :count) (plist-get to-agent :count))
+                    (progn (spyglass-bench-wait (lambda () nil) 0.05) nil)))))
+       300)
+      (let* ((end (float-time))
+             (driver (spyglass-bench-channel-result connection))
+             (exact (and agent
+                         (equal (plist-get driver :digest) (plist-get to-driver :digest))
+                         (eq (plist-get driver :order) t)
+                         (equal (plist-get agent :digest) (plist-get to-agent :digest))
+                         (eq (plist-get agent :order) t))))
+        (spyglass-bench--command "chan-cleanup")
+        (spyglass-bench-channel-cleanup)
+        (if (eq direction 'agent)
+            (list :channels t :time (- end start) :exact exact
+                  :sender agent :receiver driver)
+          (list :channels t :time (- end start) :exact exact
+                :sender driver :receiver agent))))))
+
+(defun spyglass-bench--channels-row (name direction result)
+  "Return the table row of the channels scenario NAME in DIRECTION with RESULT."
+  (let ((sender (plist-get result :sender))
+        (receiver (plist-get result :receiver)))
+    (cl-flet ((lat (r) (let ((l (plist-get r :latency)))
+                         (if (consp l) (spyglass-bench--pair l) "-"))))
+      (list name direction
+            (format "%.1f" (/ (or (plist-get receiver :bytes) 0) 1e6))
+            (format "%.2f" (plist-get result :time))
+            (format "%.1f" (/ (or (plist-get (plist-get sender :stats) :bytes-out) 0) 1e6))
+            (lat receiver) (lat sender) "-"
+            (format "%.2f" (or (plist-get sender :cpu) 0))
+            "-"
+            (format "%d/%d" (/ (or (plist-get sender :rss-peak) 0) 1024)
+                    (/ (or (plist-get receiver :rss-peak) 0) 1024))
+            (if (plist-get result :exact) "yes" "NO")))))
 
 ;;;; The table
 
@@ -502,6 +596,10 @@ ends; MATCHED is non-nil when every size was reached."
   (spyglass-bench-start-guard)
   (add-hook 'spyglass-error-functions
             (lambda (_c msg) (spyglass-bench--log "error: %s" msg)))
+  (add-hook 'spyglass-connection-state-functions
+            (lambda (c state)
+              (when (and (eq c spyglass-bench--connection) (eq state 'reconnecting))
+                (cl-incf spyglass-bench--breaks))))
   (let ((rows nil) (failed nil)
         (process-environment (if spyglass-bench--remote
                                  (append '("SPYGLASS_EAT_EL=" "SPYGLASS_VTERM_EL="
@@ -521,21 +619,29 @@ ends; MATCHED is non-nil when every size was reached."
                     (spyglass-bench--log "%s %s: skipped, no %s on both ends"
                                          name direction (plist-get options :terminal))
                   (spyglass-bench--log "%s, %s owning..." name direction)
+                  (setq spyglass-bench--breaks 0)
                   (when (spyglass-bench--getenv "SPYGLASS_BENCH_PROFILE")
                     (require 'profiler)
                     (profiler-start 'cpu))
                   (condition-case err
                       (let* ((result (cond
+                                      ((plist-get options :channels)
+                                       (spyglass-bench--channels direction args))
                                       ((and (plist-get options :resize) (eq direction 'agent))
-                                       (spyglass-bench--agent-owns-resize args))
+                                       (spyglass-bench--agent-owns-resize args options))
                                       ((plist-get options :resize)
-                                       (spyglass-bench--driver-owns-resize args))
+                                       (spyglass-bench--driver-owns-resize args options))
                                       ((eq direction 'agent)
                                        (spyglass-bench--agent-owns scenario args options))
                                       (t (spyglass-bench--driver-owns scenario args options))))
-                             (row (spyglass-bench--row
-                                   name (if (eq direction 'agent) "agent→driver" "driver→agent")
-                                   result)))
+                             (dir (if (eq direction 'agent) "agent→driver" "driver→agent"))
+                             (row (if (plist-get result :channels)
+                                      (spyglass-bench--channels-row name dir result)
+                                    (spyglass-bench--row name dir result))))
+                        (when (> spyglass-bench--breaks 0)
+                          (setf (car (last row)) (format "%s b%d" (car (last row))
+                                                         spyglass-bench--breaks))
+                          (unless (plist-get options :drops) (push name failed)))
                         (spyglass-bench--log "%S" row)
                         (when (spyglass-bench--getenv "SPYGLASS_BENCH_PROFILE")
                           (profiler-stop)
@@ -558,8 +664,13 @@ ends; MATCHED is non-nil when every size was reached."
                                                (plist-get o :string-mb) (plist-get o :gc-pct))
                           (spyglass-bench--log "viewer: %S" (plist-get (plist-get result :viewer) :stats))
                           (spyglass-bench--log "owner stats: %S" (plist-get o :stats)))
-                        (unless (spyglass-bench--same-p (plist-get result :owner)
-                                                        (plist-get result :viewer))
+                        (when (and (plist-get result :channels)
+                                   (not (plist-get result :exact)))
+                          (push name failed)
+                          (spyglass-bench--log "channels differ: %S" result))
+                        (unless (or (plist-get result :channels)
+                                    (spyglass-bench--same-p (plist-get result :owner)
+                                                            (plist-get result :viewer)))
                           (push name failed)
                           (let ((a (append (plist-get (plist-get (plist-get result :owner) :digest)
                                                       :overlay-list) nil))
@@ -576,6 +687,9 @@ ends; MATCHED is non-nil when every size was reached."
                         (push row rows))
                     (error (push name failed)
                            (spyglass-bench--log "%s failed: %s" name (error-message-string err))
+                           (ignore-errors (spyglass-bench--chatter nil))
+                           (ignore-errors (spyglass-bench-channel-cleanup))
+                           (ignore-errors (spyglass-bench--command "chan-cleanup"))
                            (ignore-errors (spyglass-bench-viewer-cleanup))
                            (ignore-errors (spyglass-bench-owner-cleanup))
                            (ignore-errors (spyglass-bench--command "cleanup")))))))))

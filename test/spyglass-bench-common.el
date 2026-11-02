@@ -43,6 +43,18 @@
 ;; - resize: a buffer of lines its viewers size as a terminal, without
 ;;   a process, so that it runs on every host; the viewer shows it in
 ;;   windows of several sizes (`spyglass-bench-show-mirror').
+;;
+;; A large scenario's FRAME-CHARS sets `spyglass-frame-chars' on the
+;; owner, for frames far larger than sockets' buffers.  During any
+;; scenario, both ends may ping each other and send small channel
+;; messages every few milliseconds (`spyglass-bench-chatter'), so that
+;; writes that wait meet frames sent by timers and filters.
+;;
+;; Channels are measured apart: each end sends messages on the channel
+;; "bench" to the other, at once, small ones a millisecond apart and
+;; large ones among them (`spyglass-bench-channel-send'); the receiver
+;; checks their order and digests, and measures the small ones'
+;; latency.
 
 ;;; Code:
 
@@ -493,6 +505,8 @@ cells, (COLUMNS . ROWS)."
     (with-current-buffer buffer (setq buffer-undo-list t))
     (when (equal scenario "large")
       (spyglass-bench-fill-large buffer (plist-get args :size)))
+    (setq spyglass-frame-chars (or (plist-get args :frame-chars)
+                                   (default-value 'spyglass-frame-chars)))
     (when (equal scenario "resize")
       (spyglass-bench-make-sizable buffer))
     (let ((prepared (- (float-time) start))
@@ -625,6 +639,7 @@ CALLBACK gets the owner's measurements as a plist."
           (when (get-buffer-process buffer) (delete-process (get-buffer-process buffer)))
           (kill-buffer buffer)))))
   (setq spyglass-bench--owner nil)
+  (setq spyglass-frame-chars (eval (car (get 'spyglass-frame-chars 'standard-value)) t))
   (garbage-collect))
 
 ;;;; The viewer's side
@@ -660,6 +675,134 @@ CALLBACK gets the owner's measurements as a plist."
     (let ((buffer (plist-get spyglass-bench--viewer :buffer)))
       (when (buffer-live-p buffer) (kill-buffer buffer))))
   (setq spyglass-bench--viewer nil)
+  (garbage-collect))
+
+;;;; Chatter and channels
+
+(defvar spyglass-bench--chatter nil
+  "Timer pinging the peer and sending it channel messages, or nil.")
+
+(defun spyglass-bench-chatter (connection interval)
+  "Ping CONNECTION's peer and send it a channel message every INTERVAL seconds.
+INTERVAL nil or 0 stops.  The messages go to the channel
+\"bench-chatter\", which no one registers: the peer counts them."
+  (when spyglass-bench--chatter
+    (cancel-timer spyglass-bench--chatter)
+    (setq spyglass-bench--chatter nil))
+  (when (and interval (> interval 0))
+    (let ((n 0))
+      (setq spyglass-bench--chatter
+            (run-with-timer
+             0 interval
+             (lambda ()
+               (when (spyglass-connection-live-p connection)
+                 (spyglass--ping connection)
+                 (spyglass-channel-send connection "bench-chatter"
+                                        (list :n (cl-incf n) :t0 (float-time))))))))))
+
+(defvar spyglass-bench--channel nil
+  "What the channel \"bench\" received, a plist.")
+
+(defun spyglass-bench--message-text (n size)
+  "Return the text of message N, SIZE characters, a few not ASCII."
+  (let ((head (format "%08d é→ " n)))
+    (concat head (make-string (max 0 (- size (length head))) (+ ?a (% n 26))))))
+
+(defun spyglass-bench--percentiles (samples)
+  "Return the median and 99th percentile of SAMPLES, a plist, or nil."
+  (when samples
+    (let* ((sorted (sort (copy-sequence samples) #'<))
+           (n (length sorted)))
+      (list :p50 (nth (/ n 2) sorted)
+            :p99 (nth (min (1- n) (floor (* 0.99 n))) sorted)
+            :max (car (last sorted))))))
+
+(defun spyglass-bench--channel-receive (connection message)
+  "Note MESSAGE, received on the channel \"bench\" of CONNECTION."
+  (let* ((n (plist-get message :n))
+         (text (plist-get message :s))
+         (t0 (plist-get message :t0))
+         (offset (spyglass-connection-clock-offset connection))
+         (now (float-time))
+         (state spyglass-bench--channel))
+    (unless (and (integerp n) (> n (plist-get state :last)))
+      (setq state (plist-put state :order nil)))
+    (setq state (plist-put state :last n))
+    (setq state (plist-put state :count (1+ (plist-get state :count))))
+    (setq state (plist-put state :bytes (+ (plist-get state :bytes) (string-bytes text))))
+    (setq state (plist-put state :digests (cons (md5 text) (plist-get state :digests))))
+    (when (and (numberp t0) offset (< (length text) 1000))
+      (setq state (plist-put state :latencies
+                             (cons (- (+ now offset) t0) (plist-get state :latencies)))))
+    (setq spyglass-bench--channel (plist-put state :end now))))
+
+(defun spyglass-bench-channel-reset (&optional connection)
+  "Forget what the channel \"bench\" received, and listen to it.
+CONNECTION's channel counters are measured from now."
+  (setq spyglass-bench--channel
+        (list :count 0 :bytes 0 :digests nil :latencies nil :order t :last -1 :end nil
+              :base (and connection (spyglass-channel-stats connection))))
+  (spyglass-register-channel "bench" #'spyglass-bench--channel-receive)
+  (spyglass-bench-reset-peak)
+  (setq spyglass-bench--channel
+        (plist-put spyglass-bench--channel :cpu (spyglass-bench-cpu))))
+
+(defun spyglass-bench-channel-send (connection args)
+  "Send on CONNECTION's channel \"bench\" the messages ARGS describe.
+ARGS has :small, small messages sent one a millisecond, and :large,
+messages of :size characters spread among them.  Return what the
+peer should receive: (:count N :digest DIGEST), the digest of every
+message's text in order."
+  (let* ((small (or (plist-get args :small) 0))
+         (large (or (plist-get args :large) 0))
+         (size (or (plist-get args :size) 0))
+         (total (+ small large))
+         (every (if (> large 0) (max 1 (/ total large)) 0))
+         (plan nil))
+    ;; Large messages go at regular places among the small.
+    (let ((left large))
+      (dotimes (n total)
+        (push (if (and (> left 0) (zerop (% (1+ n) every)))
+                  (progn (cl-decf left) size)
+                120)
+              plan)))
+    (setq plan (nreverse plan))
+    (let ((digests (cl-loop for len in plan for n from 0
+                            collect (md5 (spyglass-bench--message-text n len))))
+          (n 0))
+      (spyglass-bench--every
+       0.001
+       (lambda ()
+         (if (or (>= n total) (not (spyglass-connection-live-p connection)))
+             t
+           (spyglass-channel-send connection "bench"
+                                  (list :n n :t0 (float-time)
+                                        :s (spyglass-bench--message-text n (nth n plan))))
+           (setq n (1+ n))
+           nil)))
+      (list :count total :digest (md5 (mapconcat #'identity digests ""))))))
+
+(defun spyglass-bench-channel-result (&optional connection)
+  "Return what the channel \"bench\" received, and CONNECTION's channel counters."
+  (let ((state spyglass-bench--channel))
+    (list :count (plist-get state :count)
+          :bytes (plist-get state :bytes)
+          :order (if (plist-get state :order) t :false)
+          :digest (md5 (mapconcat #'identity (reverse (plist-get state :digests)) ""))
+          :end (or (plist-get state :end) :false)
+          :latency (or (spyglass-bench--percentiles (plist-get state :latencies)) :false)
+          :cpu (- (spyglass-bench-cpu) (plist-get state :cpu))
+          :rss-peak spyglass-bench--rss-peak
+          :stats (if connection
+                     (let ((base (plist-get state :base)))
+                       (cl-loop for (k v) on (spyglass-channel-stats connection) by #'cddr
+                                nconc (list k (- v (or (plist-get base k) 0)))))
+                   :false))))
+
+(defun spyglass-bench-channel-cleanup ()
+  "Stop listening to the channel \"bench\"."
+  (spyglass-unregister-channel "bench")
+  (setq spyglass-bench--channel nil)
   (garbage-collect))
 
 (provide 'spyglass-bench-common)

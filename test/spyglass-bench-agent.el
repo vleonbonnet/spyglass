@@ -77,7 +77,23 @@
                                                     (plist-get args :rows))))
              (spyglass-bench-agent--say
               (list :id id :result (list :cols (car cells) :rows (cdr cells))))))
+          ("chatter"
+           (spyglass-bench-chatter (car (spyglass-connections)) (plist-get args :interval))
+           (spyglass-bench-agent--say (list :id id :result (list :ok t))))
+          ("chan-reset"
+           (spyglass-bench-channel-reset (car (spyglass-connections)))
+           (spyglass-bench-agent--say (list :id id :result (list :ok t))))
+          ("chan-send"
+           (spyglass-bench-agent--say
+            (list :id id :result (spyglass-bench-channel-send (car (spyglass-connections)) args))))
+          ("chan-result"
+           (spyglass-bench-agent--say
+            (list :id id :result (spyglass-bench-channel-result (car (spyglass-connections))))))
+          ("chan-cleanup"
+           (spyglass-bench-channel-cleanup)
+           (spyglass-bench-agent--say (list :id id :result (list :rss (spyglass-bench-rss)))))
           ("cleanup"
+           (spyglass-bench-chatter nil nil)
            (spyglass-bench-owner-cleanup)
            (spyglass-bench-viewer-cleanup)
            (spyglass-bench-agent--say (list :id id :result (list :rss (spyglass-bench-rss)))))
