@@ -51,11 +51,18 @@ all: compile test
 compile:
 	$(BATCH) $(NO_WARNINGS) -f batch-byte-compile $(SOURCES)
 
+# Each test file runs in a batch Emacs of its own: memory a file's large
+# frames and buffers leave to Emacs's allocator stays with it, and all
+# of them in one Emacs went past the 2 GB a batch Emacs may take.
 test:
-	$(NOPIPE) SPYGLASS_EAT_EL="$(EAT_EL)" SPYGLASS_VTERM_EL="$(VTERM_EL)" \
-	SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
-	$(EMACS_BATCH) -l test/spyglass-test-helpers.el \
-	  $(addprefix -l ,$(TESTS)) -f ert-run-tests-batch-and-exit
+	@status=0; \
+	for file in $(TESTS); do \
+	  $(NOPIPE) SPYGLASS_EAT_EL="$(EAT_EL)" SPYGLASS_VTERM_EL="$(VTERM_EL)" \
+	  SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
+	  $(EMACS_BATCH) -l test/spyglass-test-helpers.el -l $$file -f ert-run-tests-batch-and-exit \
+	    < /dev/null || { echo "$$file failed"; status=1; }; \
+	done; \
+	exit $$status
 
 lint:
 	$(BATCH) --eval '(dolist (file (list $(patsubst %,"%",$(SOURCES)))) (checkdoc-file file))'

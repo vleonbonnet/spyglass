@@ -24,7 +24,7 @@ Emacs Lisp library mirroring live buffers between two Emacs instances, on one ho
 
 ## Verification
 
-- `make compile lint test` before every commit. `EAT_EL`, `VTERM_EL` (vterm.el with its module built beside it, in a copy of the sources), `GHOSTEL_EL` and `GHOSTEL_MODULE_DIR` add tests and benchmarks of real terminals.
+- `make compile lint test` before every commit. `make test` runs each test file in a batch Emacs of its own, which keeps each under 2 GB. `EAT_EL`, `VTERM_EL` (vterm.el with its module built beside it, in a copy of the sources), `GHOSTEL_EL` and `GHOSTEL_MODULE_DIR` add tests and benchmarks of real terminals.
 - `make test-gui` (with `GHOSTEL_EL` and `GHOSTEL_MODULE_DIR`, and `EMACS` a graphical build) for anything touching parking frames or windows; on macOS run it with the Mac port and with GNU Emacs's Cocoa build when you can.
 - `make bench` for performance work (localhost), and with `BENCH_REMOTE` across hosts. A scenario's `exact` column must say `yes`: the owner's and the mirror's digests agree.
 
