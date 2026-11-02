@@ -391,5 +391,116 @@ the mirrors end exact, without an error or the stream ever breaking."
               (ignore-errors (spyglass-unshare buffer))
               (kill-buffer buffer))))))))
 
+(ert-deftest spyglass-conn-heartbeat-settings ()
+  "Heartbeats take integers and floats, and refuse what makes no heartbeat.
+A connection is looked at every half of the shorter of the interval
+and what the timeout leaves after it: integers halved in integer
+arithmetic gave 0 for 1, a timer that never repeated."
+  (should (= (spyglass--heartbeat-period 1.0 4.0) 0.5))
+  (should (= (spyglass--heartbeat-period 10.0 40.0) 5.0))
+  (should (= (spyglass--heartbeat-period 3.0 4.0) 0.5))
+  (spyglass-conn-test--with (client server)
+    (spyglass-connection-set-heartbeat client 1 4)
+    (should (eql (spyglass--heartbeat-interval client) 1.0))
+    (should (eql (spyglass--heartbeat-timeout client) 4.0))
+    (should (eql (timer--repeat-delay (spyglass-connection-timer client)) 0.5))
+    (spyglass-connection-set-heartbeat client 3 nil)
+    (should (eql (spyglass--heartbeat-timeout client) (float spyglass-heartbeat-timeout)))
+    (should (eql (timer--repeat-delay (spyglass-connection-timer client)) 1.5))
+    (dolist (bad '((0 4) (-1 4) (1 0) (4 4) (5 4) ("1" 4) (1 "4") (nil 5)))
+      (ert-info ((format "%S" bad))
+        (should-error (apply #'spyglass-connection-set-heartbeat client bad))))
+    ;; Refused settings leave the last good ones.
+    (should (eql (spyglass--heartbeat-interval client) 3.0))
+    ;; Options set wrong give way to their standard values, and say so.
+    (let ((spyglass-heartbeat-interval 50)
+          (spyglass-test-errors nil))
+      (should (equal (spyglass--heartbeat-settings server) '(10.0 . 40.0)))
+      (spyglass--schedule-heartbeat server)
+      (should (seq-some (lambda (m) (string-match-p "not below timeout" m)) spyglass-test-errors))
+      (should (eql (timer--repeat-delay (spyglass-connection-timer server)) 5.0)))))
+
+(defun spyglass-conn-test--start-peer (dir)
+  "Start another batch Emacs serving spyglass, registered in DIR.
+Return (PROCESS . PID): PROCESS runs it under `timeout', PID is that
+Emacs's own, from its registration.  It exits by itself after a
+minute."
+  (let* ((file (expand-file-name "server.json" dir))
+         (source (file-name-directory (locate-library "spyglass")))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (form (format "(progn (spyglass-server-start :file %S) (let ((end (+ (float-time) 60))) (while (< (float-time) end) (accept-process-output nil 0.05))))"
+                       file))
+         (process (make-process
+                   :name "spyglass-peer" :connection-type 'pipe :noquery t
+                   :buffer (generate-new-buffer " *spyglass-peer*")
+                   :command (list "sh" "-c"
+                                  (concat "trap '' PIPE; exec timeout 90 "
+                                          (mapconcat #'shell-quote-argument
+                                                     (list emacs "-Q" "--batch" "-L" source
+                                                           "--eval" "(setq load-prefer-newer t)"
+                                                           "-l" "spyglass" "--eval" form)
+                                                     " "))))))
+    (spyglass-test-wait (lambda () (or (file-exists-p file) (not (process-live-p process)))) 30)
+    (let ((pid (and (file-exists-p file)
+                    (with-temp-buffer
+                      (insert-file-contents file)
+                      (plist-get (json-parse-string (buffer-string) :object-type 'plist) :pid)))))
+      (unless pid
+        (error "The peer did not start: %s"
+               (with-current-buffer (process-buffer process) (buffer-string))))
+      (cons process pid))))
+
+(ert-deftest spyglass-conn-heartbeat-drops-frozen-peer ()
+  "A peer stopped by SIGSTOP is dropped within the timeout, given in integers.
+Its stream stays open to the system: only heartbeats tell.  With
+`spyglass-connection-set-heartbeat' given 1 and 4, the connection was
+looked at once, after (/ 1 2) seconds, and never again, so that a
+frozen peer stayed connected for as long as it was stopped."
+  (skip-unless (not (memq system-type '(windows-nt ms-dos))))
+  (skip-unless (executable-find "timeout"))
+  (let* ((dir (make-temp-file "spyglass-peer-" t))
+         (peer (spyglass-conn-test--start-peer dir))
+         (pid (cdr peer))
+         (spyglass-test-errors nil)
+         (connection nil)
+         (stopped nil))
+    (unwind-protect
+        (progn
+          (setq connection (spyglass-connect (spyglass-file-transport
+                                              (expand-file-name "server.json" dir))
+                                             :name "frozen"))
+          (spyglass-test-wait (lambda () (spyglass-connection-live-p connection)) 20)
+          (should (spyglass-connection-live-p connection))
+          (spyglass-connection-set-heartbeat connection 1 4)
+          (should (eql (timer--repeat-delay (spyglass-connection-timer connection)) 0.5))
+          ;; Heartbeats keep a peer that is silent but running.
+          (spyglass-test-settle 3)
+          (should (spyglass-connection-live-p connection))
+          (signal-process pid 'SIGSTOP)
+          (setq stopped t)
+          (let ((start (float-time)))
+            (spyglass-test-wait (lambda () (not (spyglass-connection-live-p connection))) 15)
+            (should-not (spyglass-connection-live-p connection))
+            (let ((elapsed (- (float-time) start)))
+              ;; The timeout and a look past it; not before the peer
+              ;; was silent long enough, heard last at most a heartbeat
+              ;; and a look before it stopped.
+              (should (< elapsed 5.5))
+              (should (> elapsed 2.0))))
+          (should (seq-some (lambda (m) (string-match-p "No word from frozen for 4s" m))
+                            spyglass-test-errors))
+          (signal-process pid 'SIGCONT)
+          (setq stopped nil)
+          (spyglass-test-wait (lambda () (spyglass-connection-live-p connection)) 20)
+          (should (spyglass-connection-live-p connection)))
+      (when stopped (signal-process pid 'SIGCONT))
+      (when connection (spyglass-disconnect connection))
+      (signal-process pid 'SIGTERM)
+      (spyglass-test-wait (lambda () (not (process-live-p (car peer)))) 10)
+      (let ((buffer (process-buffer (car peer))))
+        (when (process-live-p (car peer)) (delete-process (car peer)))
+        (kill-buffer buffer))
+      (delete-directory dir t))))
+
 (provide 'spyglass-conn-test)
 ;;; spyglass-conn-test.el ends here

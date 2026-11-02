@@ -506,45 +506,94 @@ resume."
 (defvar spyglass--heartbeats (make-hash-table :test #'eq :weakness 'key)
   "Heartbeat settings of connections, as (INTERVAL . TIMEOUT), by connection.")
 
+(defun spyglass--heartbeat-problem (interval timeout)
+  "Return why INTERVAL and TIMEOUT, in seconds, make no heartbeat, or nil.
+Both must be positive numbers, and INTERVAL below TIMEOUT: a peer that
+is silent until it is sent a heartbeat would be dropped first."
+  (cond
+   ((not (and (numberp interval) (> interval 0)))
+    (format "interval %S is not a positive number" interval))
+   ((not (and (numberp timeout) (> timeout 0)))
+    (format "timeout %S is not a positive number" timeout))
+   ((>= interval timeout)
+    (format "interval %s is not below timeout %s" interval timeout))))
+
 (defun spyglass-connection-set-heartbeat (connection interval timeout)
   "Have CONNECTION send heartbeats every INTERVAL seconds and drop after TIMEOUT.
 They replace `spyglass-heartbeat-interval' and
 `spyglass-heartbeat-timeout' for CONNECTION alone, for instance so that
 an application notices a silent peer sooner on a local network.  Nil
-for either keeps the default."
-  (puthash connection (cons interval timeout) spyglass--heartbeats)
+for either keeps the default.  Both are numbers of seconds, integers
+or floats, and INTERVAL must be below TIMEOUT: signal an error
+otherwise."
+  (when-let* ((problem (spyglass--heartbeat-problem
+                        (or interval spyglass-heartbeat-interval)
+                        (or timeout spyglass-heartbeat-timeout))))
+    (error "Spyglass heartbeat of %s: %s" (spyglass-connection-label connection) problem))
+  (puthash connection (cons (and interval (float interval)) (and timeout (float timeout)))
+           spyglass--heartbeats)
   (when (eq (spyglass-connection-state connection) 'open)
     (spyglass--schedule-heartbeat connection)))
 
+(defun spyglass--heartbeat-settings (connection)
+  "Return CONNECTION's heartbeat interval and timeout, (INTERVAL . TIMEOUT).
+Seconds, as floats: those `spyglass-connection-set-heartbeat' gave,
+else `spyglass-heartbeat-interval' and `spyglass-heartbeat-timeout'.
+When these make no heartbeat (see `spyglass--heartbeat-problem'), as
+when an option was set wrong, the options' standard values instead."
+  (let* ((own (gethash connection spyglass--heartbeats))
+         (interval (or (car own) spyglass-heartbeat-interval))
+         (timeout (or (cdr own) spyglass-heartbeat-timeout)))
+    (if (spyglass--heartbeat-problem interval timeout)
+        (cons (float (eval (car (get 'spyglass-heartbeat-interval 'standard-value)) t))
+              (float (eval (car (get 'spyglass-heartbeat-timeout 'standard-value)) t)))
+      (cons (float interval) (float timeout)))))
+
 (defun spyglass--heartbeat-interval (connection)
   "Return the seconds of silence after which CONNECTION sends a heartbeat."
-  (or (car (gethash connection spyglass--heartbeats)) spyglass-heartbeat-interval))
+  (car (spyglass--heartbeat-settings connection)))
 
 (defun spyglass--heartbeat-timeout (connection)
   "Return the seconds without word after which CONNECTION is dropped."
-  (or (cdr (gethash connection spyglass--heartbeats)) spyglass-heartbeat-timeout))
+  (cdr (spyglass--heartbeat-settings connection)))
+
+(defun spyglass--heartbeat-period (interval timeout)
+  "Return how often to look at a connection of INTERVAL and TIMEOUT, in seconds.
+Half the shorter of INTERVAL and of what TIMEOUT leaves after it: a
+heartbeat goes within half that after INTERVAL of silence, and its
+answer has the other half to come before TIMEOUT; a silent peer is
+dropped within that after TIMEOUT."
+  (/ (min interval (- timeout interval)) 2.0))
 
 (defun spyglass--schedule-heartbeat (connection)
   "Check CONNECTION's liveness every few seconds."
   (spyglass--cancel-timer connection)
-  (let ((interval (spyglass--heartbeat-interval connection)))
+  (let* ((own (gethash connection spyglass--heartbeats))
+         (problem (spyglass--heartbeat-problem
+                   (or (car own) spyglass-heartbeat-interval)
+                   (or (cdr own) spyglass-heartbeat-timeout)))
+         (settings (spyglass--heartbeat-settings connection))
+         (period (spyglass--heartbeat-period (car settings) (cdr settings))))
+    (when problem
+      (spyglass--report connection "Heartbeat of %s: %s; using %gs and %gs"
+                        (spyglass-connection-label connection) problem
+                        (car settings) (cdr settings)))
     (setf (spyglass-connection-timer connection)
-          (run-with-timer (/ interval 2) (/ interval 2)
-                          #'spyglass--heartbeat connection))))
+          (run-with-timer period period #'spyglass--heartbeat connection))))
 
 (defun spyglass--heartbeat (connection)
   "Send a heartbeat on CONNECTION, or drop it when the peer went silent."
   (spyglass--guard connection
-    (let ((now (float-time))
-          (interval (spyglass--heartbeat-interval connection))
-          (timeout (spyglass--heartbeat-timeout connection)))
+    (let* ((now (float-time))
+           (settings (spyglass--heartbeat-settings connection))
+           (interval (car settings))
+           (timeout (cdr settings)))
       (cond
        ((not (eq (spyglass-connection-state connection) 'open))
         (spyglass--cancel-timer connection))
        ((> (- now (spyglass-connection-last-recv connection)) timeout)
-        (spyglass--report connection "No word from %s for %ds"
-                          (spyglass-connection-label connection)
-                          (round timeout))
+        (spyglass--report connection "No word from %s for %gs"
+                          (spyglass-connection-label connection) timeout)
         (spyglass--drop connection))
        ((or (> (- now (spyglass-connection-last-send connection)) interval)
             (> (- now (spyglass-connection-last-recv connection)) interval))

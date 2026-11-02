@@ -71,7 +71,7 @@ Nothing below prompts; every function returns at once, and what happens on the n
 - =(spyglass-disconnect CONNECTION)=, =(spyglass-connections)=, =(spyglass-connection-state CONNECTION)= (=connecting=, =open=, =reconnecting=, =closed=), =(spyglass-connection-shares CONNECTION)=, =(spyglass-list-shares CONNECTION CALLBACK)=, =(spyglass-connection-label CONNECTION)=, =(spyglass-connection-capable-p CONNECTION CAPABILITY)=.
 - =spyglass-connection-state-functions=, =spyglass-shares-changed-functions=, =spyglass-error-functions= :: Hooks on every connection's state, a peer's shares, and errors.
 - =spyglass-connection-attach-functions=, =spyglass-connection-detach-functions= :: Hooks run with a connection as each stream's handshake succeeds, and with (CONNECTION FINAL) as a stream ends, FINAL non-nil when the connection will not come back.
-- =(spyglass-connection-set-heartbeat CONNECTION INTERVAL TIMEOUT)= :: Heartbeats of one connection: every INTERVAL seconds of silence, the peer dropped after TIMEOUT, instead of =spyglass-heartbeat-interval= and =spyglass-heartbeat-timeout=.
+- =(spyglass-connection-set-heartbeat CONNECTION INTERVAL TIMEOUT)= :: Heartbeats of one connection: every INTERVAL seconds of silence, the peer dropped after TIMEOUT, instead of =spyglass-heartbeat-interval= and =spyglass-heartbeat-timeout=. Seconds, integers or floats, positive, INTERVAL below TIMEOUT, else an error; nil keeps the default. A silent peer is dropped within TIMEOUT and half the shorter of INTERVAL and TIMEOUT − INTERVAL.
 
 ** Channels
 
