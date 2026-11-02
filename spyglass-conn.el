@@ -268,8 +268,11 @@ updates and channels, rather wait while `spyglass--writing-p'."
 (defun spyglass--write (connection process frame size quiet)
   "Write FRAME, SIZE bytes, on PROCESS, CONNECTION's stream; then its queue.
 Return SIZE once FRAME is written, or nil when its write failed,
-reported unless QUIET.  Frames queued meanwhile are written after it;
-a failure drops them, the stream being broken."
+reported unless QUIET.  Frames queued meanwhile are written after it.
+A failed write may have left part of a frame on the stream, which no
+later frame can follow: the stream is dropped, with what was queued,
+and comes back as after any failure, unless the connection is being
+closed."
   (let ((writer (spyglass--make-queue))
         (written nil))
     (process-put process 'spyglass-writer writer)
@@ -286,9 +289,11 @@ a failure drops them, the stream being broken."
                 (setq next (spyglass--queue-pop writer))))
           (error
            ;; A stream deleted on purpose meanwhile fails quietly.
-           (unless (or (and quiet (not written))
-                       (not (eq process (spyglass-connection-process connection))))
-             (spyglass--report connection "Sending failed: %s" (error-message-string err)))))
+           (when (eq process (spyglass-connection-process connection))
+             (unless (and quiet (not written))
+               (spyglass--report connection "Sending failed: %s" (error-message-string err)))
+             (unless (spyglass-connection-closing connection)
+               (spyglass--drop connection)))))
       (process-put process 'spyglass-writer nil))
     written))
 
@@ -761,9 +766,36 @@ Its mirrors close and the subscriptions of its peer end."
         (delete-process process))
       (spyglass--lost connection))))
 
+(defun spyglass-reconnect (connection)
+  "Break CONNECTION's stream and have it come back, as after a failure.
+For applications finding the peer unresponsive, a request timing out
+for instance: mirrors, subscriptions and channels resume on the next
+stream as after a network failure; the peer is not told.  A
+connection made through a transport connects again, at once if it was
+waiting to; one the server accepted waits for its peer, which
+connects again when it notices the broken stream.  A failed write
+drops the stream by itself.  Return non-nil when a stream was broken
+or an attempt to connect is under way, nil when CONNECTION is closed
+or waits for its peer."
+  (let ((process (spyglass-connection-process connection))
+        (transport (spyglass-connection-transport connection)))
+    (cond
+     ((eq (spyglass-connection-state connection) 'closed) nil)
+     ((process-live-p process)
+      (spyglass--drop connection)
+      t)
+     ((not transport) nil)
+     ((spyglass-connection-timer connection)
+      (spyglass--cancel-timer connection)
+      (spyglass--reconnect connection)
+      t)
+     ;; The transport is making a stream already.
+     (t t))))
+
 (defun spyglass-connection-drop-stream (connection)
   "Break CONNECTION's stream without telling the peer, as a network failure would.
-A connection with a transport connects again.  Meant for tests."
+A connection with a transport connects again.  Meant for tests;
+applications call `spyglass-reconnect'."
   (spyglass--drop connection))
 
 ;;;; Server

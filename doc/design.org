@@ -30,7 +30,7 @@ One end listens, the other connects. The listener, =spyglass-server-start=, bind
 
 Drover or anyone may supply a transport of its own. The stream is used in binary on both sides (=set-process-coding-system= =binary=): no end-of-line conversion on Windows.
 
-A connection outlives its streams. When a stream breaks, a connecting end tries its transport again after =spyglass-reconnect-delays= (0.2, 1, 2, 5, 10, 30 s, then every 30 s), re-reading the registration, so that a restarted server with a new port and token is found. A listening end keeps the connection as an orphan for a while: when the same peer instance connects again, its new stream is adopted by the old connection object, and its mirrors resume. Only =spyglass-disconnect=, a =bye= from the peer, or a server refusing the handshake end a connection for good.
+A connection outlives its streams. When a stream breaks, a connecting end tries its transport again after =spyglass-reconnect-delays= (0.2, 1, 2, 5, 10, 30 s, then every 30 s), re-reading the registration, so that a restarted server with a new port and token is found. A listening end keeps the connection as an orphan for a while: when the same peer instance connects again, its new stream is adopted by the old connection object, and its mirrors resume. Only =spyglass-disconnect=, a =bye= from the peer, or a server refusing the handshake end a connection for good. A stream breaks when its process ends, when the peer is silent past the heartbeat timeout, when a write fails (part of a frame may be on the stream, which nothing can follow), or when an application asks with =spyglass-reconnect=, having found the peer unresponsive by its own measure.
 
 * Wire format
 

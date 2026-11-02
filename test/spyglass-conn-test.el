@@ -247,6 +247,70 @@ They wait while a handler's write waits for the peer to read."
             (should (memq 'reconnecting states)))
         (remhash "ord" spyglass--handlers)))))
 
+(ert-deftest spyglass-conn-failed-write-drops-stream ()
+  "A write that fails drops its stream, which comes back; the mirror resumes."
+  (spyglass-conn-test--with (client _server)
+    (let ((buffer (generate-new-buffer "failed-write")))
+      (unwind-protect
+          (let* ((mirror (spyglass-test-mirror client buffer))
+                 (process (spyglass-connection-process client))
+                 (send (symbol-function 'process-send-string))
+                 (failed nil))
+            (cl-letf (((symbol-function 'process-send-string)
+                       (lambda (proc string)
+                         (if (and (eq proc process) (not failed))
+                             (progn (setq failed t)
+                                    (signal 'file-error
+                                            (list "Writing to process" "Input/output error")))
+                           (funcall send proc string)))))
+              (should-not (spyglass--send client (list :t "ping" :t0 (float-time)))))
+            (should failed)
+            (should (seq-some (lambda (m) (string-match-p "Sending failed" m)) spyglass-test-errors))
+            ;; At once, not when a heartbeat times out.
+            (should-not (process-live-p process))
+            (should (eq (spyglass-connection-state client) 'reconnecting))
+            (spyglass-test-wait (lambda () (spyglass-connection-live-p client)))
+            (should (spyglass-connection-live-p client))
+            (with-current-buffer buffer (insert "after the failure\n"))
+            (spyglass-test-converge buffer mirror)
+            (should (eq (spyglass-mirror-state mirror) 'live)))
+        (kill-buffer buffer)))))
+
+(ert-deftest spyglass-conn-reconnect ()
+  "`spyglass-reconnect' breaks a stream on either end; mirrors resume."
+  (spyglass-conn-test--with (client server)
+    (let ((buffer (generate-new-buffer "reconnect")))
+      (unwind-protect
+          (let ((mirror (spyglass-test-mirror client buffer)))
+            ;; The connecting end.
+            (let ((process (spyglass-connection-process client)))
+              (should (spyglass-reconnect client))
+              (should-not (process-live-p process))
+              (spyglass-test-wait (lambda () (spyglass-connection-live-p client)))
+              (should (spyglass-connection-live-p client)))
+            ;; Waiting to connect again: now.
+            (let ((spyglass-reconnect-delays '(5)))
+              (spyglass-connection-drop-stream client))
+            (should (eq (spyglass-connection-state client) 'reconnecting))
+            (let ((start (float-time)))
+              (should (spyglass-reconnect client))
+              (spyglass-test-wait (lambda () (spyglass-connection-live-p client)) 4)
+              (should (spyglass-connection-live-p client))
+              (should (< (- (float-time) start) 4)))
+            ;; The accepting end: the peer comes back, the stream is adopted.
+            (setq server (spyglass-test-wait (lambda () (spyglass-test-other-end client))))
+            (should (spyglass-reconnect server))
+            (should-not (spyglass-reconnect server))
+            (spyglass-test-wait (lambda () (spyglass-connection-live-p server)) 8)
+            (should (spyglass-connection-live-p server))
+            (with-current-buffer buffer (insert "after reconnecting\n"))
+            (spyglass-test-converge buffer mirror)
+            (should (eq (spyglass-mirror-state mirror) 'live))
+            (should (>= (plist-get (spyglass-mirror-stats mirror) :resumes) 2))
+            (spyglass-disconnect client)
+            (should-not (spyglass-reconnect client)))
+        (kill-buffer buffer)))))
+
 (defun spyglass-conn-test--fill (buffer lines tag)
   "Add LINES lines tagged TAG to BUFFER, with faces now and then.
 Lines go at the end and, every few, at places spread through the
