@@ -11,6 +11,7 @@ Emacs Lisp library mirroring live buffers between two Emacs instances, on one ho
 - `make compile` must stay free of warnings and `make lint` (checkdoc) clean. `make test` must pass; it uses nothing beyond 127.0.0.1.
 - Nothing a peer sends is ever given to `read` or `eval`. Headers are JSON, parsed with `json-parse-string`; property values are decoded as data (`spyglass-wire-decode`) and sanitized (`spyglass-wire-sanitize-props`) on the viewer, whatever the owner did. Keep the sanitizers strict: a new display form or face attribute is allowed only if redisplay cannot evaluate anything from it.
 - Never signal into a process filter, sentinel or timer: wrap their bodies in `spyglass--guard`, report errors through `spyglass--report`.
+- Applications talk through channels (`spyglass-channel.el`), never through frame types of their own; channel messages are JSON, parsed with `json-parse-string`. Channels write no frame while `spyglass--sending` is set: a write waiting runs timers and filters, and their frame would go between the parts of the one being written.
 - The owner never queues updates: it keeps per viewer the ranges not yet sent, and reads their text when sending. Anything per viewer must stay bounded by `spyglass-max-intervals`, `spyglass-window` and `spyglass-max-styles`.
 - Library functions never prompt; only interactive commands in spyglass.el may.
 - Byte code must not depend on optional packages (Eat, Ghostel, vterm): adapters declare what they use and are loaded by `with-eval-after-load` in spyglass.el.
