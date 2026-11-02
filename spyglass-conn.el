@@ -740,10 +740,12 @@ the local end of a forwarded port."
     (let ((process (condition-case err
                        (make-network-process
                         :name "spyglass" :host host :service port
-                        :coding 'binary :noquery t :filter #'ignore
-                        :nodelay t)
+                        :coding 'binary :noquery t :filter #'ignore)
                      (error (funcall done nil (error-message-string err)) nil))))
-      (when process (funcall done process token)))))
+      (when process
+        ;; Not `:nodelay' above: Emacs 30's byte compiler refuses it.
+        (spyglass--nodelay process)
+        (funcall done process token)))))
 
 (defun spyglass-parse-registration (text)
   "Return the port and token of registration TEXT as a cons, or nil."
