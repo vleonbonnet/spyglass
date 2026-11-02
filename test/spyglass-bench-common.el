@@ -40,6 +40,9 @@
 ;;   remade, as agent-shell's Markdown rendering does.
 ;; - terminal: a real terminal of KIND, Eat, vterm or Ghostel, running
 ;;   `seq 1 COUNT'.
+;; - resize: a buffer of lines its viewers size as a terminal, without
+;;   a process, so that it runs on every host; the viewer shows it in
+;;   windows of several sizes (`spyglass-bench-show-mirror').
 
 ;;; Code:
 
@@ -443,6 +446,35 @@ SPYGLASS_BENCH_WINDOW, if set, is `spyglass-window' in bytes."
 
 ;;;; The owner's side
 
+(defun spyglass-bench--sizable-refit ()
+  "Take the size viewers give, as a terminal would, without a process."
+  (funcall (default-value 'window-adjust-process-window-size-function) nil nil))
+
+(defun spyglass-bench-make-sizable (buffer)
+  "Fill BUFFER with lines and make it a terminal viewers size, process or not.
+It takes the size of its viewers' windows, which its viewers learn: what
+the resize scenario measures, on any host, Windows included, where Eat
+has no pty."
+  (with-current-buffer buffer
+    (dotimes (i 100) (insert (spyglass-bench--line i 60)))
+    (setq-local spyglass-refit-function #'spyglass-bench--sizable-refit)))
+
+(defun spyglass-bench-show-mirror (buffer cols rows)
+  "Show BUFFER in a window about COLS by ROWS cells, and report its size.
+The window is cut from the frame of this batch Emacs.  Return its
+cells, (COLUMNS . ROWS)."
+  (delete-other-windows)
+  (let ((window (selected-window)))
+    (set-window-buffer window buffer)
+    (let ((cells (spyglass-window-cells window)))
+      (when (> (cdr cells) rows)
+        (split-window window (+ rows (- (window-total-height window) (cdr cells)))))
+      (when (> (car cells) cols)
+        (split-window window (+ cols (- (window-total-width window) (car cells))) t)))
+    (setf (spyglass--mirror-sent-size (buffer-local-value 'spyglass--mirror buffer)) nil)
+    (spyglass--mirror-report-sizes)
+    (spyglass-window-cells window)))
+
 (defvar spyglass-bench--owner nil
   "Plist of the scenario the owner plays: its buffer and measurements.")
 
@@ -461,6 +493,8 @@ SPYGLASS_BENCH_WINDOW, if set, is `spyglass-window' in bytes."
     (with-current-buffer buffer (setq buffer-undo-list t))
     (when (equal scenario "large")
       (spyglass-bench-fill-large buffer (plist-get args :size)))
+    (when (equal scenario "resize")
+      (spyglass-bench-make-sizable buffer))
     (let ((prepared (- (float-time) start))
           (share (spyglass-share buffer :id "bench")))
       (setq spyglass-bench--owner

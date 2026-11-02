@@ -48,6 +48,13 @@
 ;; - GC: garbage collections and their time on owner and viewer;
 ;; - RSS: peak resident memory of owner and viewer.
 ;;
+;; The resize scenario has the viewer show its mirror in windows of
+;; four sizes, and the owner's terminal take them: its time is the
+;; total, its latency (median and maximum) from showing a window to the
+;; owner's terminal taking its size when the driver owns, to the
+;; driver's mirror learning it back when the agent owns; `exact' says
+;; each size was reached (sN for N sizes) besides the digests.
+;;
 ;; BENCH_ONLY, a space-separated list of scenario names, restricts the
 ;; run.  Every Emacs kills itself past 2 GB of resident memory.
 
@@ -270,7 +277,8 @@
            ("vterm-seq-300k" "terminal" (:kind "vterm" :count 300000) (:terminal "vterm"))
            ("ghostel-seq-300k" "terminal" (:kind "ghostel" :count 300000)
             (:terminal "ghostel"))
-           ("reconnect-appends" "appends" (:count 100000) (:drops 3))))
+           ("reconnect-appends" "appends" (:count 100000) (:drops 3))
+           ("resize" "resize" nil (:resize t))))
         (only (spyglass-bench--getenv "SPYGLASS_BENCH_ONLY")))
     (if only
         (let ((names (split-string only)))
@@ -335,6 +343,71 @@
         (spyglass-bench-owner-cleanup)
         (list :prepared prepared :owner owner :viewer viewer)))))
 
+;;;; Resizing
+
+(defconst spyglass-bench--sizes '((40 . 10) (79 . 20) (25 . 6) (60 . 15))
+  "Sizes, in cells, the viewer's window takes in the resize scenario.
+They fit the frame of a batch Emacs.")
+
+(defun spyglass-bench--resize-result (latencies matched)
+  "Return the measurements of the resize scenario: LATENCIES and MATCHED.
+LATENCIES are seconds from each report to the size known at both
+ends; MATCHED is non-nil when every size was reached."
+  (let ((sorted (sort (copy-sequence latencies) #'<)))
+    (list :resizes (length latencies) :matched matched
+          :total (apply #'+ latencies)
+          :p50 (nth (/ (length sorted) 2) sorted) :max (car (last sorted)))))
+
+(defun spyglass-bench--agent-owns-resize (args)
+  "Play the resize scenario with ARGS, the agent owning and the driver viewing."
+  (let ((prepared (spyglass-bench--command "prepare" :scenario "resize"
+                                           :args (spyglass-bench--json-args args)))
+        (latencies nil) (matched t))
+    (let* ((mirror (spyglass-bench-viewer-open spyglass-bench--connection))
+           (state (buffer-local-value 'spyglass--mirror mirror)))
+      (spyglass-bench-wait (lambda () (and (eq (spyglass-mirror-state mirror) 'live)
+                                           (spyglass--mirror-sizable state)))
+                           60)
+      (dolist (size spyglass-bench--sizes)
+        (let* ((start (float-time))
+               (cells (spyglass-bench-show-mirror mirror (car size) (cdr size))))
+          ;; The size went to the owner, which tells its viewers.
+          (spyglass-bench-wait (lambda () (equal (spyglass--mirror-grid state) cells)) 30)
+          (unless (equal (spyglass--mirror-grid state) cells) (setq matched nil))
+          (push (- (float-time) start) latencies)))
+      (delete-other-windows)
+      (let* ((owner (spyglass-bench--command "run"))
+             (viewer (spyglass-bench-viewer-result)))
+        (spyglass-bench-viewer-cleanup)
+        (spyglass-bench--command "cleanup")
+        (list :prepared prepared
+              :owner (plist-put owner :resize (spyglass-bench--resize-result latencies matched))
+              :viewer viewer)))))
+
+(defun spyglass-bench--driver-owns-resize (args)
+  "Play the resize scenario with ARGS, the driver owning and the agent viewing."
+  (let* ((prepared (spyglass-bench-owner-prepare "resize" args))
+         (share (plist-get spyglass-bench--owner :share))
+         (latencies nil) (matched t))
+    (spyglass-bench--command "open")
+    (dolist (size spyglass-bench--sizes)
+      (let* ((start (float-time))
+             (shown (spyglass-bench--command "show" :args (list :cols (car size)
+                                                                :rows (cdr size))))
+             (cells (cons (plist-get shown :cols) (plist-get shown :rows))))
+        (spyglass-bench-wait (lambda () (equal (spyglass-share-grid share) cells)) 30)
+        (unless (equal (spyglass-share-grid share) cells) (setq matched nil))
+        (push (- (float-time) start) latencies)))
+    (let ((owner nil))
+      (spyglass-bench-owner-run (lambda (result) (setq owner result)))
+      (spyglass-bench-wait (lambda () owner) 120)
+      (let ((viewer (spyglass-bench--command "result")))
+        (spyglass-bench--command "cleanup")
+        (spyglass-bench-owner-cleanup)
+        (list :prepared prepared
+              :owner (plist-put owner :resize (spyglass-bench--resize-result latencies matched))
+              :viewer viewer)))))
+
 ;;;; The table
 
 (defun spyglass-bench--ms (seconds)
@@ -365,14 +438,20 @@
          (vstats (plist-get viewer :stats))
          (tick (plist-get ostats :tick))
          (baseline (plist-get owner :baseline))
+         (resize (plist-get owner :resize))
          (size (plist-get (plist-get owner :digest) :size)))
     (list name direction
           (format "%.1f" (/ (or size 0) 1e6))
-          (if (equal (plist-get owner :scenario) "large")
-              (format "%.2f" (or (plist-get owner :synced) 0))
-            (format "%.2f+%.2f" (or (plist-get owner :produce) 0) (or (plist-get owner :drain) 0)))
+          (cond
+           (resize (format "%.2f" (plist-get resize :total)))
+           ((equal (plist-get owner :scenario) "large")
+            (format "%.2f" (or (plist-get owner :synced) 0)))
+           (t (format "%.2f+%.2f" (or (plist-get owner :produce) 0) (or (plist-get owner :drain) 0))))
           (format "%.1f" (/ (or (plist-get ostats :bytes) 0) 1e6))
-          (spyglass-bench--pair (plist-get vstats :latency))
+          (if resize
+              (format "%s/%s" (spyglass-bench--ms (plist-get resize :p50))
+                      (spyglass-bench--ms (plist-get resize :max)))
+            (spyglass-bench--pair (plist-get vstats :latency)))
           (spyglass-bench--pair (plist-get ostats :latency))
           (if (and tick (plist-get tick :p50))
               (format "%s/%s/%s" (spyglass-bench--ms (plist-get tick :p50))
@@ -387,8 +466,11 @@
                   (or (plist-get owner :gc-time) 0) (or (plist-get viewer :gc-time) 0))
           (format "%d/%d" (/ (or (plist-get owner :rss-peak) 0) 1024)
                   (/ (or (plist-get viewer :rss-peak) 0) 1024))
-          (format "%s%s%s"
-                  (if (spyglass-bench--same-p owner viewer) "yes" "NO")
+          (format "%s%s%s%s"
+                  (if (and (spyglass-bench--same-p owner viewer)
+                           (or (null resize) (plist-get resize :matched)))
+                      "yes" "NO")
+                  (if resize (format " s%d" (plist-get resize :resizes)) "")
                   (let ((r (plist-get ostats :resumes))) (if r (format " r%d" r) ""))
                   (let ((f (plist-get ostats :full-scans))) (if f (format " f%d" f) ""))))))
 
@@ -443,9 +525,14 @@
                     (require 'profiler)
                     (profiler-start 'cpu))
                   (condition-case err
-                      (let* ((result (if (eq direction 'agent)
-                                         (spyglass-bench--agent-owns scenario args options)
-                                       (spyglass-bench--driver-owns scenario args options)))
+                      (let* ((result (cond
+                                      ((and (plist-get options :resize) (eq direction 'agent))
+                                       (spyglass-bench--agent-owns-resize args))
+                                      ((plist-get options :resize)
+                                       (spyglass-bench--driver-owns-resize args))
+                                      ((eq direction 'agent)
+                                       (spyglass-bench--agent-owns scenario args options))
+                                      (t (spyglass-bench--driver-owns scenario args options))))
                              (row (spyglass-bench--row
                                    name (if (eq direction 'agent) "agent→driver" "driver→agent")
                                    result)))

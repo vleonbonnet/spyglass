@@ -16,40 +16,42 @@ Columns:
 - =owner CPU s (alone)=: the owner's processor time during the scenario, and the producer's alone on a buffer no one sees.
 - =GC=: garbage collections and their seconds on owner/viewer.
 - =RSS MB=: peak resident memory of owner/viewer; processes run every scenario in turn, and Emacs keeps what it allocated, so later rows inherit earlier peaks.
-- =exact=: digests agree; =rN= resumptions after N broken streams; =fN= comparisons of the whole buffer the owner made.
+- =exact=: digests agree; =rN= resumptions after N broken streams; =fN= comparisons of the whole buffer the owner made; =sN= sizes the viewer's window took and the owner's terminal reached, in the =resize= scenario, whose =time s= is the total and =lat ms= the median and maximum from showing a window to the owner's terminal taking its size (driver owning) or the driver's mirror learning it back (agent owning).
 
 Emacs 31 runs here with =gc-cons-percentage= 1.0. A batch Emacs waits for events in =spyglass-bench-step=, never longer than until its next timer (see the design notes).
 
 * Localhost: Reaver, macOS, Emacs 31.1, through 127.0.0.1
 
 #+begin_example
-spyglass benchmarks, 2026-11-01 16:26, driver reaver (Emacs 31.1.50), agent localhost (Emacs 31.1.50)
+spyglass benchmarks, 2026-11-02 07:02, driver reaver (Emacs 31.1.50), agent localhost (Emacs 31.1.50)
 | scenario             | dir          | MB    | time s     | wire MB | lat ms p50/p99 | ack ms p50/p99 | tick ms p50/p99/max | owner CPU s (alone) | GC n o/v, s o/v | RSS MB o/v | exact   |
 |----------------------+--------------+-------+------------+---------+----------------+----------------+---------------------+---------------------+-----------------+------------+---------|
-| large-10M            | agent→driver | 9.1   | 0.16       | 9.3     | 99.5/158.6     | 99.5/158.7     | 4.4/23.6/23.6       | 0.06                | 2/6 0.01/0.03   | 96/70      | yes     |
-| large-10M            | driver→agent | 9.1   | 0.08       | 9.3     | 49.6/79.8      | 48.1/76.4      | 4.1/6.8/6.8         | 0.05                | 2/6 0.01/0.02   | 88/108     | yes     |
-| large-100M           | agent→driver | 100.0 | 0.64       | 102.5   | 334.2/629.0    | 335.0/632.6    | 4.2/14.7/15.0       | 0.60                | 5/19 0.05/0.12  | 284/251    | yes     |
-| large-100M           | driver→agent | 100.0 | 0.69       | 102.5   | 340.8/686.6    | 337.3/683.3    | 4.1/19.0/24.3       | 0.59                | 5/19 0.06/0.12  | 368/354    | yes     |
-| appends-100k         | agent→driver | 4.0   | 1.49+0.02  | 4.2     | 19.5/41.9      | 20.0/42.1      | 2.8/20.9/20.9       | 0.78 (0.37)         | 7/3 0.09/0.02   | 449/423    | yes     |
-| appends-100k         | driver→agent | 4.0   | 1.50+0.02  | 4.2     | 23.0/40.4      | 20.0/38.6      | 2.7/21.5/21.5       | 0.75 (0.48)         | 7/3 0.08/0.02   | 452/345    | yes     |
-| stream-50MB/s        | agent→driver | 8.0   | 4.01+0.01  | 204.3   | 24.5/68.6      | 26.1/75.4      | 4.1/9.9/14.5        | 1.96 (0.83)         | 60/91 0.34/0.47 | 379/360    | yes     |
-| stream-50MB/s        | driver→agent | 8.0   | 4.00+0.02  | 204.3   | 27.8/51.3      | 25.9/51.6      | 4.1/9.5/10.3        | 1.92 (0.78)         | 60/90 0.33/0.45 | 386/381    | yes     |
-| term-80x200          | agent→driver | 0.0   | 5.02+0.02  | 1.0     | 17.7/39.9      | 17.8/40.9      | 1.3/23.4/24.6       | 1.00 (0.35)         | 29/3 0.41/0.05  | 382/386    | yes     |
-| term-80x200          | driver→agent | 0.0   | 5.02+0.02  | 0.8     | 21.0/44.0      | 17.6/40.6      | 1.1/23.6/25.0       | 1.01 (0.34)         | 30/3 0.43/0.03  | 387/382    | yes     |
-| term-50x300          | agent→driver | 0.0   | 5.01+0.02  | 0.8     | 16.7/39.7      | 16.7/40.1      | 0.4/23.3/25.1       | 0.58 (0.26)         | 23/2 0.21/0.02  | 379/377    | yes     |
-| term-50x300          | driver→agent | 0.0   | 5.01+0.02  | 0.8     | 20.9/44.3      | 17.6/41.5      | 1.1/23.3/24.5       | 0.89 (0.33)         | 22/2 0.36/0.04  | 361/348    | yes     |
-| term-80x200-unhinted | agent→driver | 0.0   | 5.01+0.05  | 0.8     | 1.4/16.2       | 1.4/15.9       | 0.0/25.1/27.3       | 0.68 (0.36)         | 12/2 0.19/0.01  | 348/361    | yes f77 |
-| term-80x200-unhinted | driver→agent | 0.0   | 5.01+0.04  | 0.8     | 4.4/19.7       | 1.0/15.8       | 0.9/13.0/18.1       | 0.52 (0.29)         | 14/3 0.14/0.03  | 361/348    | yes f90 |
-| overlays-2000        | agent→driver | 0.4   | 2.14+4.92  | 0.5     | 16.6/21.9      | 16.6/22.0      | 0.3/5.8/6.6         | 0.42 (0.11)         | 4/1 0.03/0.01   | 351/362    | yes     |
-| overlays-2000        | driver→agent | 0.4   | 2.15+4.95  | 0.5     | 20.1/35.1      | 16.7/31.7      | 0.4/15.4/16.5       | 0.47 (0.14)         | 4/1 0.05/0.01   | 364/351    | yes     |
-| eat-seq-300k         | agent→driver | 0.1   | 13.79+0.28 | 0.4     | 227.4/1295.7   | 227.4/1295.7   | 5.9/79.9/79.9       | 12.09               | 57/0 0.97/0.00  | 358/371    | yes     |
-| eat-seq-300k         | driver→agent | 0.1   | 14.09+0.25 | 0.4     | 158.7/1314.6   | 155.2/1311.2   | 5.9/59.8/59.8       | 12.35               | 57/0 0.96/0.00  | 372/358    | yes     |
-| vterm-seq-300k       | agent→driver | 0.0   | 3.95+0.01  | 0.1     | 16.7/17.1      | 17.0/17.4      | 0.1/0.8/0.8         | 1.01                | 6/0 0.05/0.00   | 364/373    | yes     |
-| vterm-seq-300k       | driver→agent | 0.0   | 3.95+0.01  | 0.1     | 20.1/25.5      | 16.9/22.3      | 0.2/0.8/0.8         | 1.00                | 6/0 0.05/0.00   | 377/364    | yes     |
-| ghostel-seq-300k     | agent→driver | 0.0   | 3.05+0.02  | 0.1     | 16.6/22.1      | 16.6/16.6      | 0.1/0.4/0.4         | 0.20                | 0/0 0.00/0.00   | 371/378    | yes     |
-| ghostel-seq-300k     | driver→agent | 0.0   | 3.10+0.01  | 0.1     | 19.9/20.2      | 16.7/16.7      | 0.0/0.4/0.4         | 0.17                | 0/0 0.00/0.00   | 384/366    | yes     |
-| reconnect-appends    | agent→driver | 4.0   | 1.29+0.01  | 4.2     | 231.4/297.8    | 231.6/298.3    | 1.5/25.5/25.5       | 0.59                | 5/1 0.07/0.01   | 379/383    | yes r3  |
-| reconnect-appends    | driver→agent | 4.0   | 1.23+0.02  | 4.2     | 215.2/266.8    | 218.8/267.3    | 1.7/23.3/23.3       | 0.62                | 5/1 0.07/0.01   | 387/380    | yes r3  |
+| large-10M            | agent→driver | 9.1   | 0.14       | 9.3     | 68.8/131.1     | 70.9/131.2     | 4.3/15.4/15.4       | 0.06                | 2/6 0.01/0.03   | 86/74      | yes     |
+| large-10M            | driver→agent | 9.1   | 0.15       | 9.3     | 85.5/145.7     | 86.0/144.3     | 4.3/22.9/22.9       | 0.05                | 2/6 0.01/0.03   | 98/109     | yes     |
+| large-100M           | agent→driver | 100.0 | 0.88       | 102.5   | 476.5/872.2    | 478.8/876.3    | 4.2/24.6/25.8       | 0.59                | 5/19 0.05/0.11  | 281/252    | yes     |
+| large-100M           | driver→agent | 100.0 | 0.73       | 102.5   | 352.5/720.5    | 354.0/721.8    | 4.1/19.6/20.3       | 0.59                | 5/19 0.05/0.12  | 297/305    | yes     |
+| appends-100k         | agent→driver | 4.0   | 1.55+0.02  | 4.2     | 19.8/38.2      | 20.2/38.9      | 2.8/21.8/21.8       | 0.80 (0.62)         | 7/3 0.09/0.02   | 363/324    | yes     |
+| appends-100k         | driver→agent | 4.0   | 1.60+0.01  | 4.2     | 21.4/46.6      | 20.3/45.6      | 3.0/28.6/28.6       | 0.85 (0.59)         | 7/3 0.11/0.02   | 360/256    | yes     |
+| stream-50MB/s        | agent→driver | 8.0   | 4.00+0.02  | 204.3   | 26.9/133.3     | 28.8/135.0     | 4.2/21.7/26.0       | 1.92 (1.21)         | 59/88 0.33/0.45 | 282/262    | yes     |
+| stream-50MB/s        | driver→agent | 8.0   | 4.00+0.03  | 204.3   | 26.7/43.5      | 26.7/45.8      | 4.1/10.0/10.6       | 1.98 (1.09)         | 59/90 0.35/0.48 | 303/295    | yes     |
+| term-80x200          | agent→driver | 0.0   | 5.01+0.01  | 1.1     | 17.9/42.0      | 18.1/42.5      | 1.5/25.7/29.2       | 1.10 (0.32)         | 28/3 0.46/0.05  | 297/304    | yes     |
+| term-80x200          | driver→agent | 0.0   | 5.01+0.04  | 1.2     | 19.4/43.4      | 18.0/42.0      | 1.4/25.2/29.1       | 1.05 (0.30)         | 29/4 0.46/0.05  | 304/297    | yes     |
+| term-50x300          | agent→driver | 0.0   | 5.00+0.02  | 0.9     | 17.2/40.2      | 17.4/41.2      | 0.9/23.8/25.5       | 0.81 (0.30)         | 21/2 0.30/0.03  | 297/304    | yes     |
+| term-50x300          | driver→agent | 0.0   | 5.01+0.02  | 0.8     | 18.8/43.6      | 17.4/43.8      | 0.8/25.3/27.3       | 0.83 (0.30)         | 21/2 0.33/0.05  | 291/297    | yes     |
+| term-80x200-unhinted | agent→driver | 0.0   | 5.01+0.03  | 0.8     | 1.2/23.5       | 1.3/23.6       | 0.7/24.9/25.4       | 0.67 (0.32)         | 14/3 0.18/0.04  | 262/291    | yes f89 |
+| term-80x200-unhinted | driver→agent | 0.0   | 5.02+0.23  | 0.7     | 3.0/26.4       | 1.6/24.9       | 0.0/25.5/26.3       | 0.73 (0.34)         | 12/2 0.20/0.04  | 261/262    | yes f69 |
+| overlays-2000        | agent→driver | 0.4   | 2.29+5.47  | 0.5     | 17.2/39.4      | 17.4/39.5      | 0.6/21.1/22.9       | 0.65 (0.18)         | 4/1 0.07/0.01   | 264/263    | yes     |
+| overlays-2000        | driver→agent | 0.4   | 2.25+5.15  | 0.5     | 18.6/37.1      | 17.2/35.6      | 0.6/19.0/22.0       | 0.62 (0.19)         | 4/1 0.07/0.00   | 264/265    | yes     |
+| eat-seq-300k         | agent→driver | 0.1   | 12.66+0.18 | 0.3     | 171.6/3603.4   | 3580.7/3603.5  | 5.9/23.7/23.7       | 11.69               | 54/0 0.89/0.00  | 295/273    | yes     |
+| eat-seq-300k         | driver→agent | 0.1   | 12.83+0.01 | 0.4     | 2610.7/2680.5  | 2611.0/2679.0  | 6.8/59.2/59.2       | 11.83               | 54/0 0.90/0.00  | 316/295    | yes     |
+| vterm-seq-300k       | agent→driver | 0.0   | 3.95+0.01  | 0.1     | 17.0/21.0      | 17.3/21.3      | 0.1/0.8/0.8         | 1.00                | 6/0 0.05/0.00   | 301/318    | yes     |
+| vterm-seq-300k       | driver→agent | 0.0   | 3.95+0.01  | 0.1     | 18.3/18.7      | 17.1/17.5      | 0.1/0.8/0.8         | 0.99                | 6/0 0.05/0.00   | 323/301    | yes     |
+| ghostel-seq-300k     | agent→driver | 0.0   | 3.10+0.01  | 0.1     | 17.0/18.7      | 17.2/18.8      | 0.1/2.4/2.4         | 0.23                | 0/0 0.00/0.00   | 309/326    | yes     |
+| ghostel-seq-300k     | driver→agent | 0.0   | 3.10+0.02  | 0.1     | 19.3/20.1      | 17.7/18.6      | 0.2/2.2/2.2         | 0.24                | 0/0 0.00/0.00   | 331/305    | yes     |
+| reconnect-appends    | agent→driver | 4.0   | 1.37+0.01  | 4.1     | 21.3/281.7     | 33.6/281.8     | 2.1/20.3/20.3       | 0.69                | 5/1 0.08/0.01   | 315/331    | yes r3  |
+| reconnect-appends    | driver→agent | 4.0   | 1.36+0.02  | 4.2     | 20.0/271.5     | 20.8/272.1     | 1.9/22.3/22.3       | 0.67                | 5/1 0.07/0.01   | 336/320    | yes r3  |
+| resize               | agent→driver | 0.0   | 0.07       | 0.0     | 16.7/16.8      | -              | -                   | 0.00                | 0/0 0.00/0.00   | 320/337    | yes s4  |
+| resize               | driver→agent | 0.0   | 0.01       | 0.0     | 1.3/1.3        | -              | -                   | 0.00                | 0/0 0.00/0.00   | 337/320    | yes s4  |
 #+end_example
 
 Notes:
@@ -58,6 +60,7 @@ Notes:
 - Ticks stay at their 4 ms budget under load (median), whatever the buffer; their 99th percentiles of 15–25 ms are garbage collections falling in them.
 - Terminals: the hinted screens (=term-*=) send what changed only, about 0.2 MB/s for 60 rewrites a second; the unhinted one is found by comparing the whole buffer (=f77=, =f90=: at most a tenth of the time). Eat's own processing of 300 000 lines takes 12 s of processor time, mirroring a small part of it; vterm and Ghostel cost spyglass under 1 ms a tick.
 - Each broken stream resumed (=r3=), without a new snapshot.
+- =resize=: a viewer's window took four sizes and the owner's terminal each of them (=s4=), within 1–3 ms of the report on the owner and 17 ms back to the viewer (the owner describes its terminal's size at its next flush). Owners now offer viewers to size terminals: the rows of the other scenarios match those measured before, within their noise. Eat's latencies vary from run to run, 0.1 to 3.6 s at the 99th percentile, the same before and after: Eat's own processing of 300 000 lines saturates the owner, which captures between its batches of output.
 
 * Across hosts: Reaver (macOS) and Core (Windows 11, Emacs 31.1 from MSYS2 UCRT64), through =myssh -W=
 
@@ -94,3 +97,41 @@ Notes:
 - Windows timers have a resolution near 16 ms: producers timed every millisecond run slower on Core (=appends=, =overlays=), and the Windows owner's processor time includes the benchmark's own waiting loop, the =alone= figure too; compare latencies and ticks rather than processor time there.
 - Latencies across hosts go through a clock offset estimated by heartbeats, good to about 10 ms (hence a negative median for the unhinted terminal, whose latency counts from detection).
 - After a broken stream, SSH takes about a second to connect again: one resumption per run (=r1=), the later drops falling while it reconnects, and latencies near 1 s for the updates waiting meanwhile.
+
+** Sizes across hosts
+
+After parking and sizing were added (=BENCH_ONLY="resize appends-100k term-80x200 reconnect-appends"=):
+
+#+begin_example
+spyglass benchmarks, 2026-11-02 07:06, driver reaver (Emacs 31.1.50), agent core (Emacs 31.1)
+| scenario          | dir          | MB  | time s    | wire MB | lat ms p50/p99 | ack ms p50/p99 | tick ms p50/p99/max | owner CPU s (alone) | GC n o/v, s o/v | RSS MB o/v | exact  |
+|-------------------+--------------+-----+-----------+---------+----------------+----------------+---------------------+---------------------+-----------------+------------+--------|
+| appends-100k      | agent→driver | 4.0 | 7.88+0.02 | 4.2     | 32.3/91.0      | 38.8/90.9      | 2.1/37.8/39.1       | 3.13 (7.05)         | 8/6 0.18/0.12   | 118/69     | yes    |
+| appends-100k      | driver→agent | 4.0 | 1.31+0.02 | 4.2     | 20.4/41.5      | 22.1/57.0      | 2.7/24.3/24.3       | 0.60 (0.24)         | 7/6 0.07/0.05   | 153/53     | yes    |
+| term-80x200       | agent→driver | 0.0 | 5.02+0.02 | 0.7     | 25.4/64.6      | 24.3/69.9      | 1.0/9.9/14.6        | 2.14 (1.44)         | 26/2 0.21/0.01  | 46/172     | yes    |
+| term-80x200       | driver→agent | 0.0 | 5.01+0.02 | 1.3     | 15.6/37.7      | 17.7/39.9      | 0.5/6.1/6.3         | 0.44 (0.13)         | 32/18 0.17/0.14 | 173/44     | yes    |
+| reconnect-appends | agent→driver | 4.0 | 7.68+0.11 | 4.2     | 33.3/907.5     | 37.8/907.0     | 2.2/24.6/34.5       | 2.86                | 11/3 0.18/0.02  | 128/179    | yes r1 |
+| reconnect-appends | driver→agent | 4.0 | 1.29+0.02 | 4.2     | 986.5/1068.3   | 989.8/1071.3   | 1.2/18.9/18.9       | 0.63                | 8/5 0.07/0.04   | 208/52     | yes r1 |
+| resize            | agent→driver | 0.0 | 0.10      | 0.0     | 25.5/35.3      | -              | -                   | 0.03                | 0/0 0.00/0.00   | 43/224     | yes s4 |
+| resize            | driver→agent | 0.0 | 0.00      | 0.0     | 1.1/1.1        | -              | -                   | 0.00                | 0/0 0.00/0.00   | 224/43     | yes s4 |
+#+end_example
+
+The Windows agent's mirror, in windows cut from its batch frame, sized the Mac's terminal, and the reverse, each size reached (=s4=): 1 ms from the report to the owner's terminal, 25 ms back to the viewer through SSH. Windows has no pty for Eat, so the resize scenario sizes a buffer standing for a terminal, without a process, on both hosts; real Eat, vterm and Ghostel terminals are sized in the tests (=spyglass-window-test.el=) and, parked, in a graphical Emacs (=spyglass-gui-test.el=). The other rows match the earlier ones. The agent's warning comes from the streams the reconnect scenario breaks on purpose.
+
+* Parking frames, in a graphical Emacs
+
+=make test-gui= prints these, on Reaver (macOS 26), with the Mac port (Emacs 31.1) and with GNU Emacs's Cocoa build (30.2), each started with =-Q=: ten shared buffers, each watched by a mirror, receive a line before each of 500 forced redisplays, hidden (not needing a window), parked, then shown in ten windows of the visible frame; then one parked window sized by its viewer.
+
+| measure                                           | Mac port 31.1 | Cocoa 30.2 |
+|---------------------------------------------------+---------------+------------|
+| redisplay, 10 buffers changing, hidden            | 0.171 ms      | 0.146 ms   |
+| redisplay, 10 buffers changing, parked            | 0.226 ms      | 0.054 ms   |
+| redisplay, 10 buffers changing, shown in windows  | 2.051 ms      | 1.379 ms   |
+| redisplay, 10 parked buffers unchanged            | 0.142 ms      | 0.107 ms   |
+| parking 10 buffers (frames made, sized)           | 97 ms         | 111 ms     |
+| checking a parked share, at each 50 ms poll       | 23 µs         | 22 µs      |
+| resident memory of a parked window, 80×24 cells   | +2 MB         | +3 MB      |
+| 200×60 cells                                      | +8 MB         | +6 MB      |
+| 500×200 cells (=spyglass-max-terminal-size=)      | +56 MB        | +12 MB     |
+
+Redisplay does not draw invisible frames; what parked buffers add is within a few hundredths of a millisecond, where showing them would cost two. A frame takes 3 ms to make with 200 faces, 25 ms with 1 700 (Emacs recomputes every face for a new frame), and 0.3 ms to delete.

@@ -71,6 +71,12 @@
               (list :id id :result (list :state (symbol-name (spyglass-mirror-state buffer)))))))
           ("result"
            (spyglass-bench-agent--say (list :id id :result (spyglass-bench-viewer-result))))
+          ("show"
+           (let ((cells (spyglass-bench-show-mirror (plist-get spyglass-bench--viewer :buffer)
+                                                    (plist-get args :cols)
+                                                    (plist-get args :rows))))
+             (spyglass-bench-agent--say
+              (list :id id :result (list :cols (car cells) :rows (cdr cells))))))
           ("cleanup"
            (spyglass-bench-owner-cleanup)
            (spyglass-bench-viewer-cleanup)
