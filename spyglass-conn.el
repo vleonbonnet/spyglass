@@ -72,7 +72,7 @@ Owners key subscriptions by it, so that a viewer connecting again
 resumes its mirrors.")
 
 (defcustom spyglass-instance-name nil
-  "Name this Emacs gives itself to peers, or nil for `system-name'."
+  "Name this Emacs gives itself to peers, or nil for function `system-name'."
   :group 'spyglass
   :type '(choice (const nil) string))
 
@@ -190,16 +190,23 @@ Return the number of bytes sent, or nil when the stream is gone."
         (spyglass--send-frame connection frame)))))
 
 (defun spyglass--send-frame (connection frame &optional quiet)
-  "Send FRAME, a unibyte string, on CONNECTION's stream.
+  "Send FRAME, a unibyte string or a list of them, on CONNECTION's stream.
 Return its length, or nil when the stream is gone.  A failure is
 reported unless QUIET."
   (let ((process (spyglass-connection-process connection)))
     (when (process-live-p process)
       (condition-case err
-          (progn
-            (process-send-string process frame)
-            (setf (spyglass-connection-last-send connection) (float-time))
-            (length frame))
+          (if (stringp frame)
+              (progn
+                (process-send-string process frame)
+                (setf (spyglass-connection-last-send connection) (float-time))
+                (length frame))
+            (let ((n 0))
+              (dolist (part frame)
+                (process-send-string process part)
+                (setq n (+ n (length part))))
+              (setf (spyglass-connection-last-send connection) (float-time))
+              n))
         (error
          (unless quiet
            (spyglass--report connection "Sending failed: %s" (error-message-string err)))
@@ -632,6 +639,13 @@ A connection with a transport connects again.  Meant for tests."
 
 ;;;; Server
 
+(defun spyglass--nodelay (process)
+  "Disable Nagle's algorithm on PROCESS, a socket.
+Updates and acknowledgments are small and answer each other: Nagle's
+algorithm and delayed acknowledgments would hold them back tens of
+milliseconds."
+  (ignore-errors (set-network-process-option process :nodelay t)))
+
 (cl-defstruct (spyglass-server (:constructor spyglass--make-server)
                                (:copier nil))
   "A listener on 127.0.0.1."
@@ -692,6 +706,7 @@ server already runs, return it."
 
 (defun spyglass--accept (server process)
   "Make a connection for PROCESS, accepted by SERVER."
+  (spyglass--nodelay process)
   (let ((connection (spyglass--make-connection
                      :server server :mirrors (make-hash-table))))
     (push connection spyglass--connections)
@@ -725,7 +740,8 @@ the local end of a forwarded port."
     (let ((process (condition-case err
                        (make-network-process
                         :name "spyglass" :host host :service port
-                        :coding 'binary :noquery t :filter #'ignore)
+                        :coding 'binary :noquery t :filter #'ignore
+                        :nodelay t)
                      (error (funcall done nil (error-message-string err)) nil))))
       (when process (funcall done process token)))))
 

@@ -28,7 +28,9 @@ PREFER_NEWER = --eval '(setq load-prefer-newer t)'
 # A batch Emacs keeps SIGPIPE's default action, which kills it when it
 # writes to a peer that just closed; an interactive one ignores it.
 # Ignored signals stay ignored across exec.
-BATCH = trap '' PIPE; timeout $(TIMEOUT) $(EMACS) -Q --batch -L . -L test $(PREFER_NEWER)
+NOPIPE = trap '' PIPE;
+EMACS_BATCH = timeout $(TIMEOUT) $(EMACS) -Q --batch -L . -L test $(PREFER_NEWER)
+BATCH = $(NOPIPE) $(EMACS_BATCH)
 NO_WARNINGS = --eval '(setq byte-compile-error-on-warn t)'
 
 SOURCES = $(filter-out %-pkg.el %-autoloads.el,$(wildcard spyglass*.el))
@@ -42,7 +44,7 @@ compile:
 	$(BATCH) $(NO_WARNINGS) -f batch-byte-compile $(SOURCES)
 
 test:
-	SPYGLASS_EAT_EL="$(EAT_EL)" $(BATCH) -l test/spyglass-test-helpers.el \
+	$(NOPIPE) SPYGLASS_EAT_EL="$(EAT_EL)" $(EMACS_BATCH) -l test/spyglass-test-helpers.el \
 	  $(addprefix -l ,$(TESTS)) -f ert-run-tests-batch-and-exit
 
 lint:
@@ -52,13 +54,13 @@ lint:
 # 127.0.0.1, and through SSH to BENCH_REMOTE when set.  See
 # test/spyglass-bench.el.
 bench: compile
-	SPYGLASS_EMACS="$(EMACS)" SPYGLASS_TIMEOUT="$(TIMEOUT)" \
+	$(NOPIPE) SPYGLASS_EMACS="$(EMACS)" SPYGLASS_TIMEOUT="$(TIMEOUT)" \
 	SPYGLASS_EAT_EL="$(EAT_EL)" SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" \
 	SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
 	SPYGLASS_VTERM_EL="$(VTERM_EL)" SPYGLASS_VTERM_MODULE_DIR="$(VTERM_MODULE_DIR)" \
 	SPYGLASS_BENCH_REMOTE="$(BENCH_REMOTE)" SPYGLASS_BENCH_SSH="$(BENCH_SSH)" \
 	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" SPYGLASS_BENCH_ONLY="$(BENCH_ONLY)" \
-	$(BATCH) -l test/spyglass-bench.el -f spyglass-bench-main
+	$(EMACS_BATCH) -l test/spyglass-bench.el -f spyglass-bench-main
 
 clean:
 	rm -f *.elc test/*.elc

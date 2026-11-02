@@ -148,6 +148,19 @@ HEADER must hold only what `json-serialize' accepts."
     (spyglass-wire--count :bytes-out (length frame))
     frame))
 
+(defun spyglass-wire-frame-parts (header parts)
+  "Return the frame of HEADER and a payload made of PARTS, as a list of strings.
+PARTS are unibyte strings, sent one after the other rather than
+concatenated, to spare a copy of the payload."
+  (let* ((start (float-time))
+         (json (json-serialize header :null-object nil :false-object :false))
+         (plen (apply #'+ (mapcar #'length parts)))
+         (head (concat (spyglass-wire--u32 (length json)) (spyglass-wire--u32 plen) json)))
+    (spyglass-wire--count :encode-time (- (float-time) start))
+    (spyglass-wire--count :frames-out 1)
+    (spyglass-wire--count :bytes-out (+ (length head) plen))
+    (cons head parts)))
+
 (defun spyglass-wire-make-reader ()
   "Return a reader for the frames of one stream.
 Give it to `spyglass-wire-feed' with each chunk received, and free it

@@ -39,20 +39,28 @@
 
 (add-hook 'spyglass-error-functions #'spyglass-test--log-error)
 
+(defun spyglass-test-step ()
+  "Process events for at most 10 ms, or until the next timer is due.
+`accept-process-output' does not wake for a timer armed while it
+waits, so a batch Emacs waiting longer delays its timers."
+  (let* ((timer (car timer-list))
+         (until (and timer (timer-until timer nil))))
+    (accept-process-output nil (max 0.001 (min 0.01 (or until 0.01))))))
+
 (defun spyglass-test-wait (predicate &optional timeout)
   "Process events until PREDICATE returns non-nil or TIMEOUT seconds pass.
 Return PREDICATE's last value.  TIMEOUT defaults to 10 seconds."
   (let ((end (+ (float-time) (or timeout 10))) value)
     (while (and (not (setq value (funcall predicate)))
                 (< (float-time) end))
-      (accept-process-output nil 0.01))
+      (spyglass-test-step))
     value))
 
 (defun spyglass-test-settle (&optional seconds)
   "Process events for SECONDS (0.2 by default)."
   (let ((end (+ (float-time) (or seconds 0.2))))
     (while (< (float-time) end)
-      (accept-process-output nil 0.01))))
+      (spyglass-test-step))))
 
 (defun spyglass-test-runs (buffer &optional owner)
   "Return BUFFER's text and mirrored properties as a list of runs.

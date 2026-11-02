@@ -246,6 +246,26 @@
                                :resyncs)
                     1))))))
 
+(ert-deftest spyglass-e2e-shadow-to-direct ()
+  "A buffer growing past the shadow limit switches to direct capture."
+  (let ((spyglass-shadow-limit 20000))
+    (spyglass-test-with-connection connection
+      (spyglass-e2e--with-buffer "growing"
+        (insert "start\n")
+        (let ((mirror (spyglass-test-mirror connection (current-buffer)))
+              (ov (make-overlay 1 3)))
+          (overlay-put ov 'face 'bold)
+          (spyglass-test-wait (lambda () (spyglass-test-overlays mirror)) 5)
+          (should (spyglass-test-overlays mirror))
+          (dotimes (i 5000) (insert (format "line %d\n" i)))
+          (spyglass-test-converge (current-buffer) mirror)
+          (should (eq (spyglass-share-mode (spyglass-share-of (current-buffer))) 'direct))
+          ;; Overlays are not mirrored in direct capture.
+          (spyglass-test-wait (lambda () (null (spyglass-test-overlays mirror))) 5)
+          (should (null (spyglass-test-overlays mirror)))
+          (goto-char 3) (insert "more")
+          (spyglass-test-converge (current-buffer) mirror))))))
+
 (ert-deftest spyglass-e2e-many-small-appends ()
   "Ten thousand small appends arrive byte for byte."
   (spyglass-test-with-connection connection

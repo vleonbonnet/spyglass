@@ -1,0 +1,136 @@
+#+TITLE: spyglass design notes
+#+OPTIONS: toc:nil
+
+* Modules
+
+| Module                | Responsibility                                                                                                                                       |
+|-----------------------+------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =spyglass.el=         | Entry point: loads the modules and each adapter once its terminal is loaded; interactive commands                                                    |
+| =spyglass-wire.el=    | Frames, payload encoding, the JSON encoding of Lisp values, the sanitizers of faces, display specifications and strings, tokens                      |
+| =spyglass-conn.el=    | Connections: streams, handshake, heartbeats and clock offset, reconnection, requests, the server and its registration file, the TCP and SSH transports |
+| =spyglass-owner.el=   | Shares and subscriptions: capture (hooks, shadow, sentinels, hints, sweep), pending intervals, styles, frames, flow control, resumption, input        |
+| =spyglass-mirror.el=  | Mirrors: =spyglass-mirror-mode=, applying updates, overlays, the owner's cursor, the header line, acknowledgments, sending input                     |
+| =spyglass-eat.el=     | Adapter for Eat: hints around its output and resizes, its cursor, its input functions                                                                |
+| =spyglass-ghostel.el= | Adapter for Ghostel: hints from the region its renderer repainted, its cursor, its key encoder                                                       |
+| =spyglass-vterm.el=   | Adapter for vterm: its key translation (vterm's redraws run modification hooks)                                                                      |
+
+Tests are in =test/=: =spyglass-wire-test.el= (frames, values, sanitizers), =spyglass-owner-test.el= (interval arithmetic against strings, keys), =spyglass-e2e-test.el= (this Emacs sharing with itself through 127.0.0.1). The benchmarks are =spyglass-bench.el= (the driver), =spyglass-bench-agent.el= (the other Emacs) and =spyglass-bench-common.el= (scenarios, digests, the memory guard).
+
+* Roles and connections
+
+Both ends of a connection are peers. Either shares buffers and opens mirrors of the other's, over the same connection; roles belong to subscriptions, not to connections. Mirrors are never shared again: =spyglass-share= refuses a mirror, so there is no relaying.
+
+One end listens, the other connects. The listener, =spyglass-server-start=, binds 127.0.0.1 only, on a port the system chooses, and writes the port and a random token of 256 bits to its registration file, readable by its owner only. The connecting end holds a /transport/: a function that, called with a continuation, makes a byte stream to the server and passes it with the token. Transports provided:
+
+- =spyglass-tcp-transport=: a socket to a host and port, with a token.
+- =spyglass-file-transport=: this host's server, read from its registration file at each connection.
+- =spyglass-ssh-transport=: =ssh HOST cat FILE= reads the remote registration file, then =ssh -W 127.0.0.1:PORT HOST= forwards the stream over SSH's standard input and output; its standard error goes to a separate pipe, so that SSH's messages never mix with frames. Works with Windows's OpenSSH server.
+
+Drover or anyone may supply a transport of its own. The stream is used in binary on both sides (=set-process-coding-system= =binary=): no end-of-line conversion on Windows.
+
+A connection outlives its streams. When a stream breaks, a connecting end tries its transport again after =spyglass-reconnect-delays= (0.2, 1, 2, 5, 10, 30 s, then every 30 s), re-reading the registration, so that a restarted server with a new port and token is found. A listening end keeps the connection as an orphan for a while: when the same peer instance connects again, its new stream is adopted by the old connection object, and its mirrors resume. Only =spyglass-disconnect=, a =bye= from the peer, or a server refusing the handshake end a connection for good.
+
+* Wire format
+
+A frame is
+
+| bytes | content                                                                                       |
+|-------+-----------------------------------------------------------------------------------------------|
+|     4 | header length, big endian                                                                     |
+|     4 | payload length, big endian                                                                    |
+|     H | header: a JSON object, UTF-8                                                                  |
+|     P | payload: text encoded in =utf-8-emacs=, which carries every Emacs character, raw bytes too |
+
+The reader accumulates bytes in a unibyte buffer and extracts every whole frame, however the stream splits them. A frame over =spyglass-max-frame-size= (64 MB) is a protocol error and drops the stream; before the handshake succeeds, the limit is 64 KB, so that an unauthenticated stream cannot make the server allocate much.
+
+Text never goes through JSON: it rides in the payload, which costs one encoding and one decoding in C. Surrogate code points, which Emacs buffers may hold but no UTF-8 decoder returns, are replaced by U+FFFD in the payload and listed, with their offsets, in the header.
+
+Lisp values in headers (faces, display specifications, invisibility specs, strings with properties) are encoded as JSON: numbers, strings and booleans as themselves, lists as arrays, symbols as ={"y": NAME}=, dotted pairs as ={"c": [CAR, CDR]}=, vectors as ={"v": [...]}=, strings with properties as ={"S": TEXT, "p": [[START, END, PLIST]...]}=, text JSON cannot hold as ={"B": BASE64}=. Decoding yields data only, bounded in depth; it never calls =read= nor =eval=.
+
+* Protocol
+
+Messages are headers with a type, =t=. After the handshake:
+
+| type      | from      | meaning                                                                                     |
+|-----------+-----------+---------------------------------------------------------------------------------------------|
+| =hello=   | both      | protocol version, application, instance identifier and name; the connecting end's token     |
+| =error=   | both      | a refusal or protocol error, then the stream closes                                         |
+| =ping=    | both      | heartbeat, stamped with the sender's clock                                                  |
+| =pong=    | both      | answer, stamped with both clocks: round trip and clock offset                               |
+| =bye=     | both      | clean close: the connection ends for good on both sides                                     |
+| =shares=  | owner     | the list of shares, sent on connection and whenever it changes                              |
+| =req=/=res= | both    | requests with an identifier; =list= returns the shares                                      |
+| =open=    | viewer    | subscribe to a share, under a subscription identifier the viewer chooses; with =resume=, the epoch and the last update applied |
+| =u=       | owner     | an update: sequence number, operations, styles, overlays, cursor, description               |
+| =resumed= | owner     | the subscription resumed after the given update; frames after it follow                     |
+| =ack=     | viewer    | the last update applied                                                                     |
+| =close=   | viewer    | end the subscription                                                                        |
+| =closed=  | owner     | the subscription ended, with a reason: unshared, killed, no such share, expired             |
+| =in=      | viewer    | input: text (=k= "s") or a key in =key-description= form (=k= "k")                          |
+| =err=     | owner     | the input was refused or failed                                                             |
+| =fl=      | viewer    | fontify this range, which the viewer displays                                               |
+
+The handshake: both ends send =hello= at once; the server checks the token with a comparison in constant time, the protocol version (equal major versions) and the application, and answers =error= and closes otherwise. A client refused tries again later with a fresh registration.
+
+An update holds:
+
+- =seq=: its number, one more than the last; =reset= with an =epoch= for a snapshot, which empties the mirror first.
+- =ops=: replacements =[BEG OLD LEN RUNS]=, applied in order: OLD characters at BEG become the next LEN characters of the payload, with RUNS, a flat vector of lengths and style identifiers (0: no property).
+- =sd=: new styles, =[ID PLIST]=, property lists the viewer sanitizes once and keeps; =sr= forgets all styles first. =fd=: attributes of the faces the styles name, for viewers lacking them.
+- =ov=: overlays set, =[ID BEG END STYLE]=; =od=: overlays deleted.
+- =pt=, =ws=: the owner's cursor and window start, once the viewer has everything.
+- =meta=: buffer name, mode name, tab width, truncation, word wrap, invisibility spec, the owner's header line, whether fontification requests help, whether input is taken.
+- =ct=: when the earliest change it holds happened, on the owner's clock.
+
+* The owner: capture
+
+A subscription keeps the ranges of the buffer its viewer has not seen as /intervals/ =(B BL VL)=: BL characters at B in the buffer replace VL characters of the viewer's copy; they are disjoint and ascending, so the viewer position of an interval is B minus the growth of the intervals before it. Changes, =(OB OL NL)= in the buffer as it was, compose into intervals in one pass (=spyglass--intervals-compose=): overlapping or touching ranges merge, so that 100 000 appends between two captures are one interval. Past =spyglass-max-intervals= (64), the closest neighbors merge, the gap between them resent. A new subscription is one interval: the whole buffer, replacing nothing. When a frame is built, intervals are emitted from the last, so that earlier positions stay valid, and their text is read from the buffer at that moment; a long interval is emitted from its start, a frame of =spyglass-frame-chars= (256 K characters) at a time. Nothing is queued: a slow viewer costs at most its intervals, its unacknowledged frames and its styles.
+
+Changes are found in one of two ways per share, chosen when the first viewer subscribes:
+
+** Shadow capture
+
+For buffers up to =spyglass-shadow-limit= (16 M characters). The share keeps a hidden copy of the buffer as last captured, with its text properties and copies of its mirrored overlays: the /shadow/. Between 8 and 256 markers, /sentinels/, spread through the buffer split it into segments; their positions in the shadow are remembered. Markers move with every insertion and deletion, even those made with =inhibit-modification-hooks=, as Eat and Ghostel make them. At each capture:
+
+1. A segment whose length changed has changed.
+2. A segment of unchanged length may hide a rewrite of equal length. It is compared with the shadow, text and properties (=equal-including-properties= on substrings, memcmp speed), where /hints/ say changes happened: =after-change-functions=, =spyglass-notify= from adapters or callers, jit-lock's fontification. When the buffer's =buffer-chars-modified-tick= moved beyond what hooks and hints accounted for, every segment is compared, at most once per ten times the last such comparison took, so that unhinted terminals cost at most a tenth of the main thread.
+3. Each changed segment is narrowed to what differs: common prefix and suffix, found by galloping and bisecting comparisons; then, for ranges over 512 characters with as many lines on both sides, line by line, so that a terminal screen with a few changed cells sends those lines only.
+4. The changes are applied to the shadow, which the mirrored overlays in it follow; overlays in changed ranges are compared with the owner's, and those differing marked for every viewer.
+
+A sweep compares 32 K characters of buffer and shadow, and the overlays there, every 0.25 s while the buffer is quiet, so that a change no hook or hint told of (an overlay moved, a property set silently) reaches viewers within seconds.
+
+** Direct capture
+
+For larger buffers: =after-change-functions= record changes into the share's pending intervals; =before-change-functions= notices a change of text made without hooks before this one. A change of text without hooks (=buffer-chars-modified-tick= moved past what hooks saw) resends the whole buffer as one interval. Overlays are not mirrored, and silent property changes are seen only when hinted.
+
+** Properties
+
+Mirrored text properties (=spyglass-text-properties=): =face=, with =font-lock-face= standing for it where font lock shows it, =invisible=, =display=, =line-prefix=, =wrap-prefix=, and optionally =help-echo=. Overlay properties (=spyglass-overlay-properties=): =face=, =invisible=, =display=, =before-string=, =after-string=, =priority=; overlays of the owner's windows (with a =window= property, or a face such as =region= or =hl-line=) are left out. Each distinct set of properties becomes a /style/, defined once per viewer; the interning keeps frames small (a terminal's thousands of runs share a few dozen styles) and the viewer's work small (each style is sanitized once, and runs reuse its property list). Faces go by name, so that the viewer's theme draws them; each named face also travels once with its attributes as the owner resolves them, which a viewer lacking the face uses instead. When =font-lock-face= starts or stops showing, the whole buffer is resent. For buffers using jit-lock, the viewer's redisplay asks the owner to fontify what it shows (=fl=), so that mirrors of code are highlighted although the owner never displayed those parts.
+
+* Flow control and resumption
+
+Frames sent to a viewer and not acknowledged count against =spyglass-window= (4 MB). Past it, the owner stops sending to that viewer; changes keep composing into its intervals. The viewer acknowledges once per chunk of input read, for each mirror, with the last update applied. Acknowledgments also measure latency: each frame records when its earliest change happened.
+
+Unacknowledged frames are kept. When a stream breaks, the owner's subscriptions of that peer become orphans for =spyglass-resume-timeout= (300 s), still composing changes. When the viewer connects again, it sends =open= with the subscription's epoch and the last update it applied; if the owner still has the subscription with that epoch, it answers =resumed= and resends the frames after that one, then continues; otherwise, a snapshot under a new epoch. A gap in sequence numbers, which a reliable stream never shows, makes the viewer ask for a snapshot.
+
+* The viewer
+
+A mirror is a buffer in =spyglass-mirror-mode=: read-only, no undo, font lock off (faces come from the owner), no process, none of the owner's modes. Updates apply inside =save-excursion=. The mirror shows the owner's cursor (an overlay in =spyglass-cursor=), and windows on it follow the cursor while their point is where it was; moving away to read stops following. The header line says where the mirror comes from and its state: =opening=, =live=, =reconnecting=, =closed= and why.
+
+Every property value is sanitized on the viewer, whatever the owner did: faces keep names and plain attributes (no function as height), display specifications keep strings, spaces, raising, heights, margins and fringes (no images, no =when=, no forms), invisibility keeps symbols, help echoes keep strings. Unknown face names are replaced by the attributes the owner sent.
+
+* Input
+
+The viewer sends text or keys; the owner applies them in the shared buffer through, in order, the share's =:input= function, the buffer's =spyglass-input-function= (set by adapters), or =spyglass-default-input=: in comint buffers, text goes after the process mark and RET runs =spyglass-submit-function= (=comint-send-input= unless a front end sets its own, such as =agent-shell-submit=); in other buffers with a process, text and keys go to the process as a terminal sends them (=spyglass-key-bytes=); other editable buffers take text at point. A share made with =:read-only= refuses input, and says so.
+
+* Security
+
+- The server listens on 127.0.0.1 only; reaching it from elsewhere takes SSH.
+- Clients present a 256-bit random token from the registration file (=/dev/urandom= where there is one; else a SHA-256 of Emacs's generator, which the system seeds, and of what varies between instances); the comparison takes constant time.
+- Before authentication, frames are limited to 64 KB; after, to 64 MB.
+- Nothing received is read or evaluated: JSON, data decoding, sanitizers on the viewer. Keys a viewer sends are applied by the share's input function, never looked up in the owner's keymaps.
+- A process filter, sentinel or timer never signals: errors go to =spyglass-error-functions= and callbacks.
+
+* Batch Emacs and SIGPIPE
+
+Interactive Emacs ignores SIGPIPE; batch Emacs keeps its default action, so writing to a peer that just closed kills a batch Emacs before the write can fail. Tests, benchmarks and any batch use run Emacs with SIGPIPE ignored (=trap '' PIPE= before =exec=; the disposition is inherited).

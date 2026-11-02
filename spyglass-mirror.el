@@ -87,6 +87,7 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
   (epoch nil :documentation "The owner's epoch of the subscription.")
   (seq 0 :documentation "Last update applied.")
   (acked 0 :documentation "Last update acknowledged.")
+  (resync nil :documentation "Non-nil while waiting for a snapshot asked for.")
   (styles nil :documentation "Hash table of style identifiers and properties.")
   (faces nil :documentation "Hash table of face names and their attributes.")
   (overlays nil :documentation "Hash table of overlay identifiers and overlays.")
@@ -277,7 +278,8 @@ returns that mirror's buffer."
     (spyglass--send connection
                     (append (list :t "open" :sub (spyglass--mirror-id mirror)
                                   :share (spyglass--mirror-share mirror))
-                            (and (not fresh) (spyglass--mirror-epoch mirror)
+                            (and (not fresh) (not (spyglass--mirror-resync mirror))
+                                 (spyglass--mirror-epoch mirror)
                                  (list :resume (list :epoch (spyglass--mirror-epoch mirror)
                                                      :seq (spyglass--mirror-seq mirror))))))))
 
@@ -431,15 +433,32 @@ The attributes come from MIRROR's owner."
        ((not (natnump seq))
         (spyglass--report connection "Update without a sequence number"))
        ((plist-get header :reset)
+        (setf (spyglass--mirror-resync mirror) nil)
         (spyglass--mirror-reset mirror (plist-get header :epoch))
-        (spyglass--mirror-apply mirror header payload))
+        (spyglass--mirror-apply-or-resync mirror header payload))
+       ((spyglass--mirror-resync mirror)
+        (spyglass--mirror-stat mirror :skipped))
        ((<= seq (spyglass--mirror-seq mirror))
         (spyglass--mirror-stat mirror :duplicates))
        ((/= seq (1+ (spyglass--mirror-seq mirror)))
-        (spyglass--report connection "Update %d of %s missing; starting over"
-                          (1+ (spyglass--mirror-seq mirror)) (spyglass--mirror-share mirror))
-        (spyglass--mirror-send-open mirror t))
-       (t (spyglass--mirror-apply mirror header payload))))))
+        (spyglass--mirror-start-over mirror (format "update %d missing"
+                                                (1+ (spyglass--mirror-seq mirror)))))
+       (t (spyglass--mirror-apply-or-resync mirror header payload))))))
+
+(defun spyglass--mirror-apply-or-resync (mirror header payload)
+  "Apply update HEADER with PAYLOAD to MIRROR, or ask for a snapshot if it fails."
+  (condition-case err
+      (spyglass--mirror-apply mirror header payload)
+    (error (spyglass--mirror-start-over mirror (error-message-string err)))))
+
+(defun spyglass--mirror-start-over (mirror reason)
+  "Ask MIRROR's owner for a snapshot, because of REASON.
+Updates are ignored until the snapshot comes."
+  (spyglass--report (spyglass--mirror-connection mirror) "%s: %s; starting over"
+                    (spyglass--mirror-share mirror) reason)
+  (spyglass--mirror-stat mirror :resyncs)
+  (setf (spyglass--mirror-resync mirror) t)
+  (spyglass--mirror-send-open mirror t))
 
 (defun spyglass--mirror-reset (mirror epoch)
   "Empty MIRROR for a snapshot of subscription EPOCH."
@@ -623,13 +642,13 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
            (spyglass-connection-mirrors connection)))
 
 (defun spyglass--mirror-closed (connection header _payload)
-  "Close the mirror HEADER names: its owner ended it."
+  "Close the mirror HEADER names on CONNECTION: its owner ended it."
   (when-let* ((mirror (spyglass--mirror-for connection header)))
     (let ((reason (plist-get header :reason)))
       (spyglass--mirror-finish mirror (if (stringp reason) reason "closed by owner")))))
 
 (defun spyglass--mirror-resumed (connection header _payload)
-  "Note that the mirror HEADER names resumed."
+  "Note that the mirror HEADER names on CONNECTION resumed."
   (when-let* ((mirror (spyglass--mirror-for connection header)))
     (spyglass--mirror-stat mirror :resumes)
     (spyglass--mirror-set-state mirror 'live)))
@@ -718,22 +737,22 @@ MIRROR-OR-BUFFER defaults to the current buffer."
   (spyglass-mirror-send-key (key-description (this-command-keys-vector))))
 
 (defun spyglass-mirror-send-C-c ()
-  "Send C-c to the owner."
+  "Send the owner control-C, the interrupt character."
   (interactive nil spyglass-mirror-mode)
   (spyglass-mirror-send-key "C-c"))
 
 (defun spyglass-mirror-send-C-d ()
-  "Send C-d to the owner."
+  "Send the owner control-D, the end of input."
   (interactive nil spyglass-mirror-mode)
   (spyglass-mirror-send-key "C-d"))
 
 (defun spyglass-mirror-send-C-z ()
-  "Send C-z to the owner."
+  "Send the owner control-Z, which suspends a job."
   (interactive nil spyglass-mirror-mode)
   (spyglass-mirror-send-key "C-z"))
 
 (defun spyglass-mirror-send-C-j ()
-  "Send C-j to the owner."
+  "Send the owner control-J, a line feed."
   (interactive nil spyglass-mirror-mode)
   (spyglass-mirror-send-key "C-j"))
 

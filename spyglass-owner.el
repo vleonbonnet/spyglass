@@ -99,15 +99,24 @@ Larger buffers are captured through modification hooks alone."
   :group 'spyglass
   :type 'natnum)
 
-(defcustom spyglass-frame-chars 262144
+(defcustom spyglass-frame-chars 65536
   "Most characters of text sent in one frame."
   :group 'spyglass
   :type 'natnum)
 
-(defcustom spyglass-window (* 4 1024 1024)
-  "Bytes sent to a viewer and not yet acknowledged, past which sending waits."
+(defcustom spyglass-window (* 1024 1024)
+  "Bytes sent to a viewer and not yet acknowledged, past which sending waits.
+Kept near what a socket or pipe buffers, so that writes seldom wait:
+while a write waits, Emacs reads no keyboard input."
   :group 'spyglass
   :type 'natnum)
+
+(defcustom spyglass-tick-budget 0.004
+  "Seconds of sending per flush before yielding to the command loop.
+Every viewer gets at least a frame per flush; what remains is sent by
+the next flush, at once."
+  :group 'spyglass
+  :type 'number)
 
 (defcustom spyglass-max-intervals 64
   "Most ranges kept pending for a viewer; nearer ones merge past it."
@@ -162,7 +171,7 @@ EVENT is `subscribed' or `unsubscribed' with the viewer's key, or
   "Function applying a viewer's input in this buffer, or nil for the default.
 Called in the buffer with (KIND VALUE): KIND `string' and VALUE text
 to type, or KIND `key' and VALUE a key in `key-description' form,
-such as \"RET\" or \"C-c\".  See `spyglass-default-input'.")
+such as \"RET\" or \"<up>\".  See `spyglass-default-input'.")
 
 (defvar-local spyglass-submit-function nil
   "Command a viewer's RET runs in this comint buffer, or nil.
@@ -217,9 +226,7 @@ Terminal adapters return the terminal's cursor.")
   (sentinels nil :documentation "Vector of markers splitting the buffer.")
   (synced nil :documentation "Vector of the sentinels' positions in the shadow.")
   (spread-size 0 :documentation "Buffer size when sentinels were spread.")
-  (hinted nil :documentation "Non-nil when the hint markers hold a region.")
-  (hint-beg nil :documentation "Marker: start of the hinted region.")
-  (hint-end nil :documentation "Marker: end of the hinted region.")
+  (hints nil :documentation "Hinted regions, as conses of markers, newest first.")
   (hint-all nil :documentation "Non-nil: compare everything at the next capture.")
   (props-hinted nil :documentation "Non-nil: a hint came without hooks since the last capture.")
   (pending nil :documentation "Direct mode: intervals changed since the last capture.")
@@ -361,11 +368,21 @@ the buffer as it is now; ranges that overlap or touch merge."
   "Return non-nil when SHARE has subscriptions to capture for."
   (spyglass-share-mode share))
 
-(defun spyglass--schedule-flush ()
-  "Send gathered changes after `spyglass-flush-delay'."
+(defun spyglass--schedule-flush (&optional now)
+  "Send gathered changes after `spyglass-flush-delay', or as soon as idle if NOW."
+  (when (and now spyglass--flush-timer
+             (not (eq (timer--function spyglass--flush-timer) #'spyglass--flush-now)))
+    (cancel-timer spyglass--flush-timer)
+    (setq spyglass--flush-timer nil))
   (unless spyglass--flush-timer
     (setq spyglass--flush-timer
-          (run-with-timer spyglass-flush-delay nil #'spyglass--flush))))
+          (if now
+              (run-with-timer 0 nil #'spyglass--flush-now)
+            (run-with-timer spyglass-flush-delay nil #'spyglass--flush)))))
+
+(defun spyglass--flush-now ()
+  "Send what the last flush left for lack of time."
+  (spyglass--flush))
 
 (defun spyglass--after-change (beg end oldlen)
   "Note the change of OLDLEN characters at BEG into BEG..END."
@@ -394,17 +411,46 @@ the buffer as it is now; ranges that overlap or touch merge."
       (setf (spyglass-share-resync share) t))))
 (put 'spyglass--before-change 'permanent-local-hook t)
 
+(defconst spyglass--max-hints 8
+  "Most hinted regions kept apart; nearer ones merge past it.")
+
 (defun spyglass--hint (share beg end)
-  "Note that SHARE's buffer may have changed between BEG and END."
-  (if (spyglass-share-hinted share)
-      (progn
-        (when (< beg (spyglass-share-hint-beg share))
-          (set-marker (spyglass-share-hint-beg share) beg))
-        (when (> end (spyglass-share-hint-end share))
-          (set-marker (spyglass-share-hint-end share) end)))
-    (set-marker (spyglass-share-hint-beg share) beg)
-    (set-marker (spyglass-share-hint-end share) end)
-    (setf (spyglass-share-hinted share) t)))
+  "Note that SHARE's buffer may have changed between BEG and END.
+Regions are kept apart, so that a deletion at the top and an append
+at the end do not hint the whole buffer."
+  (let ((hints (spyglass-share-hints share)) (found nil))
+    (while (and hints (not found))
+      (let ((h (car hints)))
+        (when (and (<= beg (cdr h)) (>= end (car h)))
+          (when (< beg (car h)) (set-marker (car h) beg))
+          (when (> end (cdr h)) (set-marker (cdr h) end))
+          (setq found t)))
+      (setq hints (cdr hints)))
+    (unless found
+      (push (cons (copy-marker beg) (copy-marker end t)) (spyglass-share-hints share))
+      (when (> (length (spyglass-share-hints share)) spyglass--max-hints)
+        (spyglass--merge-hints share)))))
+
+(defun spyglass--merge-hints (share)
+  "Merge the two nearest hinted regions of SHARE."
+  (let* ((sorted (sort (copy-sequence (spyglass-share-hints share))
+                       (lambda (a b) (< (car a) (car b)))))
+         (best nil) (gap most-positive-fixnum))
+    (cl-loop for (a b) on sorted while b
+             do (let ((g (- (car b) (cdr a))))
+                  (when (< g gap) (setq gap g best (cons a b)))))
+    (let ((a (car best)) (b (cdr best)))
+      (set-marker (cdr a) (max (cdr a) (cdr b)))
+      (set-marker (car b) nil)
+      (set-marker (cdr b) nil)
+      (setf (spyglass-share-hints share) (delq b (spyglass-share-hints share))))))
+
+(defun spyglass--clear-hints (share)
+  "Forget SHARE's hinted regions."
+  (dolist (h (spyglass-share-hints share))
+    (set-marker (car h) nil)
+    (set-marker (cdr h) nil))
+  (setf (spyglass-share-hints share) nil))
 
 (defun spyglass--kill-buffer ()
   "Unshare the buffer being killed."
@@ -602,9 +648,10 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
          (mt (buffer-modified-tick))
          (moved (or (/= ct (spyglass-share-chars-tick share))
                     (/= mt (spyglass-share-modiff share))))
-         (hinted (spyglass-share-hinted share))
-         (hb (and hinted (marker-position (spyglass-share-hint-beg share))))
-         (he (and hinted (marker-position (spyglass-share-hint-end share))))
+         (hints (mapcar (lambda (h) (cons (marker-position (car h))
+                                          (marker-position (cdr h))))
+                        (spyglass-share-hints share)))
+         (hinted hints)
          (all (spyglass-share-hint-all share))
          (scan-start (float-time)))
     ;; Text changed after the last change hooks or hints told of: it
@@ -638,19 +685,21 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
                     (and (> ne nb)
                          (if all
                              (not (spyglass--equal-region shadow nb ob (- ne nb)))
-                           (and hb (<= nb he) (<= hb ne)
-                                (let ((cb (max nb hb)) (ce (min ne he)))
-                                  (not (spyglass--equal-region
-                                        shadow cb (+ ob (- cb nb)) (- ce cb))))))))
+                           (cl-some (lambda (h)
+                                      (and (<= nb (cdr h)) (<= (car h) ne)
+                                           (let ((cb (max nb (car h))) (ce (min ne (cdr h))))
+                                             (not (spyglass--equal-region
+                                                   shadow cb (+ ob (- cb nb)) (- ce cb))))))
+                                    hints))))
               (setq changes (nconc changes (spyglass--refine shadow nb ne ob oe))))))
         (when changes
           (spyglass--shadow-apply share changes))
         (dotimes (i k)
           (aset synced i (marker-position (aref sentinels i))))
         (spyglass--maybe-respread share)
-        (spyglass--check-overlays-after share changes hb he all)
-        (setf (spyglass-share-hinted share) nil
-              (spyglass-share-hint-all share) nil
+        (spyglass--check-overlays-after share changes hints all)
+        (spyglass--clear-hints share)
+        (setf (spyglass-share-hint-all share) nil
               (spyglass-share-props-hinted share) nil)
         (when all
           (let ((now (float-time)))
@@ -735,14 +784,15 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
           (move-overlay sov (overlay-start ov) (overlay-end ov))
           (spyglass--mark-overlay share (aref rec 0) ov)))))))
 
-(defun spyglass--check-overlays-after (share changes hb he all)
-  "Compare SHARE's overlays where CHANGES, the hint HB..HE or ALL touched."
+(defun spyglass--check-overlays-after (share changes hints all)
+  "Compare SHARE's overlays where CHANGES, HINTS or ALL touched.
+HINTS are conses of positions."
   (if all
       (spyglass--check-overlays share (point-min) (point-max))
     (dolist (change changes)
       (let ((nb (nth 3 change)))
         (spyglass--check-overlays share nb (+ nb (nth 2 change)))))
-    (when hb (spyglass--check-overlays share hb he))))
+    (dolist (h hints) (spyglass--check-overlays share (car h) (cdr h)))))
 
 ;;;; Sweep
 
@@ -773,7 +823,7 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
         (setf (spyglass-share-mode share) mode
               (spyglass-share-pending share) nil
               (spyglass-share-resync share) nil
-              (spyglass-share-hinted share) nil
+              (spyglass-share-hints share) nil
               (spyglass-share-hint-all share) nil
               (spyglass-share-props-hinted share) nil
               (spyglass-share-change-time share) nil
@@ -788,9 +838,7 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
                                                         buffer))
               (setq buffer-undo-list t))
             (setf (spyglass-share-shadow share) shadow
-                  (spyglass-share-ovs share) (make-hash-table :test #'eq)
-                  (spyglass-share-hint-beg share) (copy-marker 1)
-                  (spyglass-share-hint-end share) (copy-marker 1 t))
+                  (spyglass-share-ovs share) (make-hash-table :test #'eq))
             (spyglass--shadow-op share (lambda () (insert-buffer-substring buffer)))
             (spyglass--spread-sentinels share)
             (spyglass--check-overlays share (point-min) (point-max))))
@@ -808,10 +856,9 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
   "Stop capturing SHARE's buffer, which no one subscribes to anymore."
   (when (spyglass-share-shadow share)
     (kill-buffer (spyglass-share-shadow share)))
-  (dolist (m (append (spyglass-share-sentinels share)
-                     (list (spyglass-share-hint-beg share)
-                           (spyglass-share-hint-end share))))
-    (when (markerp m) (set-marker m nil)))
+  (seq-doseq (m (or (spyglass-share-sentinels share) []))
+    (set-marker m nil))
+  (spyglass--clear-hints share)
   (when (and (spyglass-share-jit share) (buffer-live-p (spyglass-share-buffer share)))
     (with-current-buffer (spyglass-share-buffer share)
       (remove-hook 'jit-lock-functions #'spyglass--jit-hint t)))
@@ -820,8 +867,6 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
         (spyglass-share-sentinels share) nil
         (spyglass-share-synced share) nil
         (spyglass-share-ovs share) nil
-        (spyglass-share-hint-beg share) nil
-        (spyglass-share-hint-end share) nil
         (spyglass-share-pending share) nil
         (spyglass-share-styles share) nil
         (spyglass-share-jit share) nil))
@@ -831,7 +876,7 @@ Changes are (OB OL NL NB) ascending, OB in the shadow as it was."
   (maphash (lambda (_ov rec) (spyglass--mark-overlay share (aref rec 0) nil))
            (spyglass-share-ovs share))
   (kill-buffer (spyglass-share-shadow share))
-  (dolist (m (spyglass-share-sentinels share)) (set-marker m nil))
+  (seq-doseq (m (or (spyglass-share-sentinels share) [])) (set-marker m nil))
   (setf (spyglass-share-mode share) 'direct
         (spyglass-share-shadow share) nil
         (spyglass-share-sentinels share) nil
@@ -1059,10 +1104,7 @@ no mirrored property.  ACC collects new definitions, see
              (take (min bl budget))
              (text (buffer-substring b (+ b take))))
         (push (vector vbeg vl take (spyglass--runs sub text acc)) ops)
-        (push (if enable-multibyte-characters
-                  (substring-no-properties text)
-                (string-to-multibyte (substring-no-properties text)))
-              texts)
+        (push (if enable-multibyte-characters text (string-to-multibyte text)) texts)
         (when shadow-mode
           (let ((table (spyglass-share-ovs share)))
             (dolist (ov (overlays-in (max (point-min) (1- b))
@@ -1116,14 +1158,18 @@ no mirrored property.  ACC collects new definitions, see
                 (and send-meta (list :meta meta)))))
           (setf (spyglass--sub-reset sub) nil)
           (when synced (setf (spyglass--sub-ct sub) nil))
-          (if (not texts)
-              (cons header nil)
-            (let ((payload (spyglass-wire-encode-payload
-                            (apply #'concat (nreverse texts)))))
-              (cons (if (cdr payload)
-                        (append header (list :sur (cdr payload)))
-                      header)
-                    (car payload)))))))))
+          ;; Each text is encoded apart: the frame is sent in parts.
+          (let ((offset 0) parts surrogates)
+            (dolist (text (nreverse texts))
+              (let ((encoded (spyglass-wire-encode-payload text)))
+                (push (car encoded) parts)
+                (seq-doseq (s (or (cdr encoded) []))
+                  (push (vector (+ offset (aref s 0)) (aref s 1)) surrogates))
+                (setq offset (+ offset (length text)))))
+            (cons (if surrogates
+                      (append header (list :sur (vconcat (nreverse surrogates))))
+                    header)
+                  (nreverse parts))))))))
 
 (defun spyglass--sub-restart (sub)
   "Make SUB start over from a snapshot, under a new epoch."
@@ -1144,13 +1190,14 @@ no mirrored property.  ACC collects new definitions, see
                table))))
 
 (defun spyglass--sub-frame (sub)
-  "Return SUB's next frame as (BYTES . CHANGE-TIME), or nil if none is due.
-A frame that cannot be built makes SUB start over."
+  "Return SUB's next frame as (PARTS . CHANGE-TIME), or nil if none is due.
+PARTS are the frame's strings, sent in order.  A frame that cannot
+be built makes SUB start over."
   (condition-case err
       (let ((built (spyglass--build-frame sub)))
         (when built
           (let ((ct (plist-get (car built) :ct)))
-            (cons (spyglass-wire-frame (car built) (cdr built))
+            (cons (spyglass-wire-frame-parts (car built) (cdr built))
                   (and (numberp ct) ct)))))
     (error
      (spyglass--report (spyglass--sub-connection sub) "Cannot send %s: %s; starting over"
@@ -1158,46 +1205,90 @@ A frame that cannot be built makes SUB start over."
                        (error-message-string err))
      (spyglass--sub-restart sub)
      (let ((built (spyglass--build-frame sub)))
-       (and built (cons (spyglass-wire-frame (car built) (cdr built)) nil))))))
+       (and built (cons (spyglass-wire-frame-parts (car built) (cdr built)) nil))))))
 
-(defun spyglass--sub-send (sub)
-  "Send SUB's viewer what is due, as far as the window allows."
-  (let ((connection (spyglass--sub-connection sub))
-        (share (spyglass--sub-share sub)))
-    (catch 'done
-      (while (and (< (spyglass--sub-inflight sub) spyglass-window)
-                  (spyglass--sub-live-p sub))
-        (let ((built (spyglass--sub-frame sub)))
-          (unless built (throw 'done nil))
-          (let* ((ct (cdr built))
-                 (frame (car built))
-                 (sent (spyglass--send-frame connection frame)))
-            (unless sent (throw 'done nil))
-            (push (list (spyglass--sub-seq sub) sent ct frame)
-                  (spyglass--sub-unacked sub))
-            (cl-incf (spyglass--sub-inflight sub) sent)
-            (spyglass--share-stat share :frames)
-            (spyglass--share-stat share :bytes sent)))))
-    (when (>= (spyglass--sub-inflight sub) spyglass-window)
-      (spyglass--share-stat share :window-full))))
+(defvar spyglass--sending nil
+  "Non-nil while frames are being sent.
+A write the stream cannot take at once makes Emacs wait, running
+timers and process filters meanwhile: they may change shared buffers
+and acknowledge frames, but must not send, lest captures and sends
+interleave.  They schedule a flush instead.")
+
+(defun spyglass--captured-p (share)
+  "Return non-nil when SHARE's buffer has not changed since its capture."
+  (and (= (buffer-chars-modified-tick) (spyglass-share-chars-tick share))
+       (= (buffer-modified-tick) (spyglass-share-modiff share))))
+
+(defun spyglass--sub-send (sub &optional deadline)
+  "Send SUB's viewer what is due, as far as the window allows.
+Past DEADLINE, a time, stop after the first frame and have the next
+flush continue.  The current buffer is SUB's share's, widened and
+just captured."
+  (if spyglass--sending
+      (spyglass--schedule-flush)
+    (let ((spyglass--sending t)
+          (connection (spyglass--sub-connection sub))
+          (share (spyglass--sub-share sub))
+          (first t))
+      (catch 'done
+        (while (and (< (spyglass--sub-inflight sub) spyglass-window)
+                    (spyglass--sub-live-p sub))
+          (when (and deadline (not first) (> (float-time) deadline))
+            (spyglass--schedule-flush t)
+            (throw 'done nil))
+          (setq first nil)
+          ;; Sending may have let the buffer change: capture again first.
+          (unless (spyglass--captured-p share)
+            (spyglass--schedule-flush)
+            (throw 'done nil))
+          (let ((built (spyglass--sub-frame sub)))
+            (unless built (throw 'done nil))
+            ;; Recorded before writing: the acknowledgment may come
+            ;; while the write waits.
+            (let* ((parts (car built))
+                   (size (apply #'+ (mapcar #'length parts)))
+                   (record (list (spyglass--sub-seq sub) size (cdr built) parts)))
+              (push record (spyglass--sub-unacked sub))
+              (cl-incf (spyglass--sub-inflight sub) size)
+              (let ((before (float-time)))
+                (unless (spyglass--send-frame connection parts)
+                  (throw 'done nil))
+                (spyglass--share-sample share :write (- (float-time) before))
+                (when (cdr built)
+                  (spyglass--share-sample share :queue (- before (cdr built)))))
+              (spyglass--share-stat share :frames)
+              (spyglass--share-stat share :bytes size)))))
+      (when (>= (spyglass--sub-inflight sub) spyglass-window)
+        (spyglass--share-stat share :window-full)))))
 
 (defun spyglass--flush ()
   "Capture every subscribed share and send its viewers what is due."
   (setq spyglass--flush-timer nil)
-  (dolist (share spyglass--shares)
-    (when (and (spyglass-share-mode share)
-               (buffer-live-p (spyglass-share-buffer share)))
-      (spyglass--guard nil
-        (let ((start (float-time)))
-          (with-current-buffer (spyglass-share-buffer share)
-            (save-restriction
-              (widen)
-              (spyglass--capture share)
-              (spyglass--refresh-share-state share)
-              (dolist (sub (spyglass-share-subs share))
-                (when (spyglass--sub-live-p sub)
-                  (spyglass--sub-send sub)))))
-          (spyglass--share-sample share :tick (- (float-time) start)))))))
+  (if spyglass--sending
+      (spyglass--schedule-flush)
+    (spyglass--flush-1)))
+
+(defun spyglass--flush-1 ()
+  "Capture every subscribed share and send its viewers what is due."
+  (let ((deadline (+ (float-time) spyglass-tick-budget)))
+    (dolist (share spyglass--shares)
+      (when (and (spyglass-share-mode share)
+                 (buffer-live-p (spyglass-share-buffer share)))
+        (spyglass--flush-share share deadline)))))
+
+(defun spyglass--flush-share (share deadline)
+  "Capture SHARE and send its viewers what is due, until DEADLINE."
+  (spyglass--guard nil
+    (let ((start (float-time)))
+      (with-current-buffer (spyglass-share-buffer share)
+        (save-restriction
+          (widen)
+          (spyglass--capture share)
+          (spyglass--refresh-share-state share)
+          (dolist (sub (spyglass-share-subs share))
+            (when (spyglass--sub-live-p sub)
+              (spyglass--sub-send sub deadline)))))
+      (spyglass--share-sample share :tick (- (float-time) start)))))
 
 ;;;; Polling
 
@@ -1226,7 +1317,7 @@ A frame that cannot be built makes SUB start over."
           (with-current-buffer (spyglass-share-buffer share)
             (when (or (/= (buffer-chars-modified-tick) (spyglass-share-chars-tick share))
                       (/= (buffer-modified-tick) (spyglass-share-modiff share))
-                      (spyglass-share-hinted share)
+                      (spyglass-share-hints share)
                       (spyglass-share-hint-all share)
                       (> (- now (spyglass-share-meta-time share)) 0.5)
                       (let ((window (get-buffer-window (current-buffer) t))
@@ -1252,10 +1343,10 @@ A frame that cannot be built makes SUB start over."
 ;;;; Subscriptions
 
 (defun spyglass--sub-free (sub reason)
-  "End SUB, telling its viewer REASON if it is connected."
+  "End SUB, telling its viewer REASON if it is connected and REASON is non-nil."
   (let ((share (spyglass--sub-share sub)))
     (remhash (spyglass--sub-key sub) spyglass--subs)
-    (when (spyglass--sub-live-p sub)
+    (when (and reason (spyglass--sub-live-p sub))
       (spyglass--send (spyglass--sub-connection sub)
                       (list :t "closed" :sub (spyglass--sub-id sub) :reason reason)))
     (setf (spyglass--sub-unacked sub) nil
@@ -1329,13 +1420,10 @@ A frame that cannot be built makes SUB start over."
            (<= (plist-get resume :seq) (spyglass--sub-seq existing)))
       (spyglass--resume existing connection (plist-get resume :seq)))
      (t
-      (when existing (spyglass--sub-free existing "replaced"))
-      (let ((sub (spyglass--new-sub connection share id key)))
-        (with-current-buffer (spyglass-share-buffer share)
-          (save-restriction
-            (widen)
-            (spyglass--refresh-share-state share)
-            (spyglass--sub-send sub))))))))
+      ;; The viewer asked for a snapshot under the same identifier.
+      (when existing (spyglass--sub-free existing nil))
+      (spyglass--new-sub connection share id key)
+      (spyglass--schedule-flush)))))
 
 (defun spyglass--resume (sub connection seq)
   "Resume SUB on CONNECTION after frame SEQ, which its viewer applied."
@@ -1350,8 +1438,9 @@ A frame that cannot be built makes SUB start over."
     (spyglass--share-stat share :resumes)
     (spyglass--send connection (list :t "resumed" :sub (spyglass--sub-id sub) :seq seq
                                      :resent (length kept)))
-    (dolist (rec (reverse kept))
-      (spyglass--send-frame connection (nth 3 rec)))
+    (let ((spyglass--sending t))
+      (dolist (rec (reverse kept))
+        (spyglass--send-frame connection (nth 3 rec))))
     (spyglass--schedule-flush)))
 
 (defun spyglass--owner-close (connection header _payload)
