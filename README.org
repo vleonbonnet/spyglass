@@ -37,7 +37,7 @@ The server listens on 127.0.0.1 only and writes its port and a random token to =
   (pop-to-buffer (spyglass-open conn "*shell*"))
 #+end_src
 
-=spyglass-ssh-transport= reads the remote registration file with =ssh HOST cat FILE= (=spyglass-remote-registration-file=), then runs =ssh -W 127.0.0.1:PORT HOST= for the stream; =spyglass-ssh-program= names the SSH client. Interactively: =M-x spyglass-connect-host=, then =M-x spyglass-open-share=.
+=spyglass-ssh-transport= reads the remote registration file with =ssh HOST cat FILE= (=spyglass-remote-registration-file=), then runs =ssh -W 127.0.0.1:PORT HOST= for the stream; =spyglass-ssh-program= names the SSH client. Once a stream so made has authenticated, connecting again runs only the second, until one fails to. Interactively: =M-x spyglass-connect-host=, then =M-x spyglass-open-share=.
 
 ** In a mirror
 
@@ -66,7 +66,7 @@ Nothing below prompts; every function returns at once, and what happens on the n
 
 - =(spyglass-server-start &key PORT FILE)=, =(spyglass-server-stop)=, =(spyglass-server)= :: The listener on 127.0.0.1, its registration file, the running server.
 - =(spyglass-connect TRANSPORT &key NAME CALLBACK PLIST)= :: Connect through TRANSPORT and return the connection, which connects again whenever its stream breaks, until =spyglass-disconnect=. CALLBACK gets =(CONNECTION EVENT DATA)= for =state=, =error= and =shares=.
-- Transports: =(spyglass-ssh-transport HOST &key PROGRAM FILE ARGS)=, =(spyglass-file-transport &optional FILE)= for this host, =(spyglass-tcp-transport HOST PORT TOKEN)=. A transport is any function called with a continuation DONE, which it calls with a process streaming to the peer's server and the token, or with nil and a message; drover can supply its own.
+- Transports: =(spyglass-ssh-transport HOST &key PROGRAM FILE ARGS)=, =(spyglass-file-transport &optional FILE)= for this host, =(spyglass-tcp-transport HOST PORT TOKEN)=. A transport is any function called with a continuation DONE, which it calls with a process streaming to the peer's server and the token, or with nil and a message; drover can supply its own. Attempts never have Emacs wait for the network or another host: sockets connect without waiting, host names are resolved by another Emacs, SSH runs in processes whose sentinels carry on, and an attempt still going after =spyglass-connect-timeout= (20 s) fails. Only starting a process makes Emacs wait, as long as the system takes, usually under a millisecond: the SSH transport starts one per attempt once it knows the port, two before.
 - =(spyglass-reconnect CONNECTION)= :: Break the connection's stream, without telling the peer, and have it come back as after a network failure, mirrors and channels resuming: for an application finding its peer unresponsive. A connection made through a transport connects again, at once if it was waiting to; an accepted one waits for its peer. A write that fails drops its stream by itself.
 - =(spyglass-disconnect CONNECTION)=, =(spyglass-connections)=, =(spyglass-connection-state CONNECTION)= (=connecting=, =open=, =reconnecting=, =closed=), =(spyglass-connection-shares CONNECTION)=, =(spyglass-list-shares CONNECTION CALLBACK)=, =(spyglass-connection-label CONNECTION)=, =(spyglass-connection-capable-p CONNECTION CAPABILITY)=.
 - =spyglass-connection-state-functions=, =spyglass-shares-changed-functions=, =spyglass-error-functions= :: Hooks on every connection's state, a peer's shares, and errors.
@@ -117,6 +117,8 @@ The owner sends, for each viewer, the ranges it has not seen, read from the buff
   make test-gui GHOSTEL_EL=DIR GHOSTEL_MODULE_DIR=DIR  # parking, in a graphical Emacs
   make bench                 # two batch Emacs through 127.0.0.1
   make bench BENCH_REMOTE=host BENCH_SSH=ssh BENCH_REMOTE_EMACS=emacs
+  make lag LAG_SSH_HOST=localhost  # how long attempts to connect keep Emacs waiting
+  make lag-gui LAG_SSH_HOST=localhost  # the same in a graphical Emacs
 #+end_src
 
 See [[file:AGENTS.md][AGENTS.md]] for the rules every change follows, and [[file:doc/design.org][doc/design.org]] for the protocol and design.

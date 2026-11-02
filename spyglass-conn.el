@@ -99,6 +99,14 @@ For tests: pacing is otherwise for streams whose writes block.")
   :group 'spyglass
   :type 'number)
 
+(defcustom spyglass-connect-timeout 20.0
+  "Seconds a transport may take to make a stream, before the handshake.
+Transports resolve host names, connect sockets and read registrations
+without Emacs waiting for them; an attempt still going after this
+fails, and the connection tries again later."
+  :group 'spyglass
+  :type 'number)
+
 (defvar spyglass-instance-id
   (substring (spyglass-wire-random-token) 0 24)
   "Identifier of this Emacs instance, fresh each session.
@@ -732,6 +740,8 @@ on the stream block, for pacing it (see `spyglass--pace-start')."
             (name (plist-get header :name))
             (caps (plist-get header :caps)))
         (setq connection (spyglass--adopt connection peer-id))
+        ;; Transports may trust what made a stream that authenticated.
+        (process-put (spyglass-connection-process connection) 'spyglass-authenticated t)
         (setf (spyglass-connection-authenticated connection) t
               (spyglass-connection-peer-id connection) peer-id
               (spyglass-connection-peer-name connection)
@@ -1090,7 +1100,8 @@ TRANSPORT is a function called with one argument, a function DONE,
 whenever a stream is needed: at first and after each loss.  It must
 call DONE, synchronously or later, with a process yielding a byte
 stream to the peer's spyglass server and the server's token, or with
-nil and a message explaining the failure.  See
+nil and a message explaining the failure.  It should not have Emacs
+wait meanwhile, for the network nor for another host.  See
 `spyglass-tcp-transport' and `spyglass-ssh-transport'.  The process
 must not have received output before DONE is called.
 
@@ -1277,20 +1288,158 @@ Connections already accepted stay."
 
 ;;;; Transports
 
+;; A transport never has Emacs wait for the network: sockets connect
+;; with `:nowait', host names are resolved by another Emacs (Emacs
+;; resolves them synchronously, `:nowait' or not, except with glibc's
+;; getaddrinfo_a), registrations are read by processes whose sentinels
+;; take it from there, and a timer ends an attempt still going after
+;; `spyglass-connect-timeout'.  What Emacs cannot avoid is starting a
+;; process: it waits for the system to start it, which takes a
+;; millisecond or less, but took up to a second in an Emacs running for
+;; hours on a Mac with an endpoint security agent.  Hence the SSH
+;; transport starts one process per attempt once it knows where the
+;; server listens.
+
+(defun spyglass--spawn (&rest arguments)
+  "Start a process with `make-process' ARGUMENTS, from the home directory.
+Emacs starts processes in the current buffer's directory, having
+checked that it exists: the buffer current when a timer runs may be
+any, its directory on a network file system slow to answer, or gone."
+  (let ((default-directory (file-name-as-directory (expand-file-name "~"))))
+    (apply #'make-process arguments)))
+
+(defun spyglass--numeric-address (host)
+  "Return HOST when it is a numeric address, which needs no resolving, else nil."
+  (and (stringp host)
+       ;; Only addresses look so, and their check reports no error.
+       (string-match-p "\\`\\(?:[0-9.]+\\|.*:.*\\)\\'" host)
+       (let ((inhibit-message t) (message-log-max nil))
+         (network-lookup-address-info host nil 'numeric))
+       host))
+
+(defconst spyglass--resolver
+  "(let ((addresses (network-lookup-address-info (getenv \"SPYGLASS_RESOLVE\"))))
+     (dolist (address addresses)
+       (princ (format-network-address address t))
+       (terpri))
+     (kill-emacs (if addresses 0 1)))"
+  "Program of the Emacs resolving the host name in SPYGLASS_RESOLVE.
+It prints the addresses of the host, one per line, or Emacs's error.")
+
+(defun spyglass--resolve (host callback)
+  "Resolve HOST in another Emacs, then call CALLBACK with its addresses.
+CALLBACK gets a list of numeric addresses, as strings, or nil and a
+message.  Return the resolving process, or nil when it could not start,
+CALLBACK having been told."
+  (let ((buffer (generate-new-buffer " *spyglass-resolve*" t))
+        (process-environment (cons (concat "SPYGLASS_RESOLVE=" host) process-environment)))
+    (condition-case err
+        (spyglass--spawn
+         :name "spyglass-resolve" :buffer buffer :noquery t :connection-type 'pipe
+         :coding 'utf-8
+         :command (list (expand-file-name invocation-name invocation-directory)
+                        "-Q" "--batch" "--eval" spyglass--resolver)
+         :sentinel
+         (lambda (process _event)
+           (unless (process-live-p process)
+             (let* ((text (and (buffer-live-p buffer)
+                               (with-current-buffer buffer (string-trim (buffer-string)))))
+                    (addresses (and text (eq (process-status process) 'exit)
+                                    (zerop (process-exit-status process))
+                                    (delq nil (mapcar #'spyglass--numeric-address
+                                                      (split-string text "[\r\n]+" t))))))
+               (when (buffer-live-p buffer) (kill-buffer buffer))
+               (if addresses
+                   (funcall callback addresses)
+                 (funcall callback nil
+                          (format "cannot resolve %s%s" host
+                                  (if (and text (not (string-empty-p text)))
+                                      (concat ": " (if (string-prefix-p (concat host " ") text)
+                                                       (substring text (1+ (length host)))
+                                                     text))
+                                    ""))))))))
+      (error (kill-buffer buffer)
+             (funcall callback nil (error-message-string err))
+             nil))))
+
+(defun spyglass--connect-socket (host service done)
+  "Connect to SERVICE on HOST without waiting, then call DONE.
+DONE is called once: with the connected process and nil, or with nil
+and a message when no address of HOST accepts, HOST cannot be resolved,
+or `spyglass-connect-timeout' seconds pass first.  A numeric HOST is
+connected to at once, a host name resolved first (`spyglass--resolve')
+and its addresses tried in turn."
+  (let ((pending nil) (timer nil) (finished nil))
+    (cl-labels
+        ((finish (process message)
+           (when timer
+             (cancel-timer timer)
+             (setq timer nil))
+           (setq pending nil)
+           (if finished
+               (when (processp process) (delete-process process))
+             (setq finished t)
+             (funcall done process message)))
+         (connect (addresses problem)
+           (if (null addresses)
+               (finish nil problem)
+             (let ((address (car addresses)) (rest (cdr addresses)))
+               (condition-case err
+                   (let ((process (make-network-process
+                                   :name "spyglass" :host address :service service
+                                   :coding 'binary :noquery t :nowait t :filter #'ignore
+                                   :sentinel (lambda (process event)
+                                               (settle process event address rest)))))
+                     (setq pending process)
+                     ;; A connection may complete at once, without telling.
+                     (settle process nil address rest))
+                 (error (connect rest (format "%s: %s" address (error-message-string err))))))))
+         (settle (process event address rest)
+           (when (and (eq process pending) (not finished))
+             (pcase (process-status process)
+               ('connect nil)
+               ('open
+                (set-process-sentinel process #'ignore)
+                (finish process nil))
+               (status
+                (setq pending nil)
+                (delete-process process)
+                (connect rest (format "%s port %s: %s" address service
+                                      (if event (string-trim event) status))))))))
+      (setq timer (run-with-timer
+                   spyglass-connect-timeout nil
+                   (lambda ()
+                     (setq timer nil)
+                     (let ((process pending))
+                       (finish nil (format "connecting to %s timed out after %gs"
+                                           host spyglass-connect-timeout))
+                       (when (process-live-p process) (delete-process process))))))
+      (if (spyglass--numeric-address host)
+          (connect (list host) nil)
+        (let ((resolver (spyglass--resolve host (lambda (addresses &optional message)
+                                                  (unless finished
+                                                    (setq pending nil)
+                                                    (if addresses
+                                                        (connect addresses nil)
+                                                      (finish nil message)))))))
+          (unless finished
+            (setq pending resolver)))))))
+
 (defun spyglass-tcp-transport (host port token)
   "Return a transport connecting to PORT on HOST with TOKEN.
 HOST is usually \"127.0.0.1\", the server listening there only, or
-the local end of a forwarded port."
+the local end of a forwarded port.  A host name is resolved by another
+Emacs, Emacs's own resolving making it wait; give an address rather.
+The stream comes once connected, Emacs not waiting meanwhile, or not
+after `spyglass-connect-timeout'."
   (lambda (done)
-    (let ((process (condition-case err
-                       (make-network-process
-                        :name "spyglass" :host host :service port
-                        :coding 'binary :noquery t :filter #'ignore)
-                     (error (funcall done nil (error-message-string err)) nil))))
-      (when process
-        ;; Not `:nodelay' above: Emacs 30's byte compiler refuses it.
-        (spyglass--nodelay process)
-        (funcall done process token)))))
+    (spyglass--connect-socket host port
+                              (lambda (process message)
+                                (if (not process)
+                                    (funcall done nil message)
+                                  ;; Not `:nodelay' when made: Emacs 30's byte compiler refuses it.
+                                  (spyglass--nodelay process)
+                                  (funcall done process token))))))
 
 (defun spyglass-parse-registration (text)
   "Return the port and token of registration TEXT as a cons, or nil."
@@ -1306,11 +1455,15 @@ the local end of a forwarded port."
 (defun spyglass-file-transport (&optional file)
   "Return a transport to the server of this host registered in FILE.
 FILE defaults to `spyglass-registration-file'; it is read again at
-each connection, so that a restarted server is found."
+each connection, so that a restarted server is found.  It is read as a
+local file, without file name handlers: a remote one, which would have
+Emacs wait for its host, is not found."
   (lambda (done)
     (let ((reg (condition-case nil
                    (with-temp-buffer
-                     (insert-file-contents (or file spyglass-registration-file))
+                     (let ((file-name-handler-alist nil)
+                           (coding-system-for-read 'utf-8))
+                       (insert-file-contents (or file spyglass-registration-file)))
                      (spyglass-parse-registration (buffer-string)))
                  (error nil))))
       (if (not reg)
@@ -1333,52 +1486,106 @@ each connection, so that a restarted server is found."
                      :buffer (generate-new-buffer (format " *%s-stderr*" name) t)
                      :sentinel #'ignore))
 
+(defun spyglass--discard-sink (sink)
+  "Delete SINK, made by `spyglass--stderr-sink' for no process, and its buffer."
+  (let ((buffer (process-buffer sink)))
+    (when (process-live-p sink) (delete-process sink))
+    (when (buffer-live-p buffer) (kill-buffer buffer))
+    nil))
+
 (cl-defun spyglass-ssh-transport (host &key (program spyglass-ssh-program)
                                        (file spyglass-remote-registration-file)
                                        args)
   "Return a transport to the spyglass server of HOST through SSH.
-At each connection, read the server's registration FILE on HOST with
-`PROGRAM ARGS HOST cat FILE', then open a stream with `PROGRAM ARGS -W
+To connect, read the server's registration FILE on HOST with `PROGRAM
+ARGS HOST cat FILE', then open a stream with `PROGRAM ARGS -W
 127.0.0.1:PORT HOST', SSH forwarding standard input and output to the
-port.  PROGRAM defaults to `spyglass-ssh-program'; ARGS are extra
-options, such as (\"-p\" \"2222\").  FILE goes to the remote shell as
-it is, so that it expands `~'; that shell must know `cat', as POSIX
-shells and PowerShell do."
-  (lambda (done)
-    (let* ((out (generate-new-buffer " *spyglass-registration*" t))
-           (sink (spyglass--stderr-sink "spyglass-registration"))
-           (command (append (list program) args
-                            (list "-o" "BatchMode=yes" host (concat "cat " file)))))
+port.  Once a stream so made has authenticated, connecting again opens
+one to the same port with the same token at once, and FILE is read
+again only after such a stream did not authenticate: Emacs waits for
+the system to start each process, which may be long.  It waits for
+neither process otherwise, and an attempt fails after
+`spyglass-connect-timeout'.
+
+PROGRAM defaults to `spyglass-ssh-program'; ARGS are extra options,
+such as (\"-p\" \"2222\").  FILE goes to the remote shell as it is, so
+that it expands `~'; that shell must know `cat', as POSIX shells and
+PowerShell do."
+  ;; (PORT TOKEN STREAM): where the server was, and the last stream to it.
+  (let ((known nil))
+    (lambda (done)
+      (cl-flet ((stream (port token)
+                  (spyglass--ssh-stream host program args port token
+                                        (lambda (process &optional token)
+                                          (when (processp process)
+                                            (setq known (list port token process)))
+                                          (funcall done process token)))))
+        (if (and known (process-get (nth 2 known) 'spyglass-authenticated))
+            (stream (nth 0 known) (nth 1 known))
+          (setq known nil)
+          (spyglass--read-registration host program args file
+                                       (lambda (reg message)
+                                         (if reg
+                                             (stream (car reg) (cdr reg))
+                                           (funcall done nil message)))))))))
+
+(defun spyglass--read-registration (host program args file callback)
+  "Read the registration FILE on HOST through PROGRAM ARGS, then call CALLBACK.
+CALLBACK is called once: with the server's port and token, as a cons,
+and nil; or with nil and a message, at the latest after
+`spyglass-connect-timeout'."
+  (let ((out (generate-new-buffer " *spyglass-registration*" t))
+        (sink (spyglass--stderr-sink "spyglass-registration"))
+        (finished nil) (timer nil) (process nil))
+    (cl-flet ((finish (reg message)
+                ;; Deleting the process runs its sentinel at once.
+                (setq finished t)
+                (when timer
+                  (cancel-timer timer)
+                  (setq timer nil))
+                (let ((stderr (if process
+                                  (spyglass--discard-process process)
+                                (spyglass--discard-sink sink))))
+                  (when (buffer-live-p out) (kill-buffer out))
+                  (funcall callback reg
+                           (and message
+                                (concat message (if stderr (concat ": " stderr) "")))))))
       (condition-case err
-          (make-process
-           :name "spyglass-registration" :buffer out :command command
-           :coding 'utf-8 :noquery t :connection-type 'pipe :stderr sink
-           :sentinel
-           (lambda (process _event)
-             (unless (process-live-p process)
-               (let ((reg (and (eq (process-status process) 'exit)
-                               (zerop (process-exit-status process))
-                               (with-current-buffer out
-                                 (spyglass-parse-registration (buffer-string))))))
-                 (process-put process 'spyglass-stderr sink)
-                 (let ((stderr (spyglass--discard-process process)))
-                   (kill-buffer out)
-                   (if (not reg)
-                       (funcall done nil
-                                (format "no spyglass server registered on %s%s" host
-                                        (if stderr (concat ": " stderr) "")))
-                     (spyglass--ssh-stream host program args (car reg) (cdr reg)
-                                           done)))))))
-        (error (kill-buffer out)
-               (spyglass--discard-process sink)
-               (funcall done nil (error-message-string err)))))))
+          (progn
+            (setq process
+                  (spyglass--spawn
+                   :name "spyglass-registration" :buffer out
+                   :command (append (list program) args
+                                    (list "-o" "BatchMode=yes" host (concat "cat " file)))
+                   :coding 'utf-8 :noquery t :connection-type 'pipe :stderr sink
+                   :sentinel
+                   (lambda (process _event)
+                     (unless (or finished (process-live-p process))
+                       (let ((reg (and (eq (process-status process) 'exit)
+                                       (zerop (process-exit-status process))
+                                       (buffer-live-p out)
+                                       (with-current-buffer out
+                                         (spyglass-parse-registration (buffer-string))))))
+                         (if reg
+                             (finish reg nil)
+                           (finish nil (format "no spyglass server registered on %s" host))))))))
+            (process-put process 'spyglass-stderr sink)
+            (setq timer (run-with-timer
+                         spyglass-connect-timeout nil
+                         (lambda ()
+                           (setq timer nil)
+                           (unless finished
+                             (finish nil (format "reading the registration on %s timed out after %gs"
+                                                 host spyglass-connect-timeout)))))))
+        (error (unless finished
+                 (finish nil (error-message-string err))))))))
 
 (defun spyglass--ssh-stream (host program args port token done)
   "Call DONE with a stream to PORT on HOST through PROGRAM and TOKEN.
 ARGS are extra options for PROGRAM."
   (let ((sink (spyglass--stderr-sink (format "spyglass-%s" host))))
     (condition-case err
-        (let ((stream (make-process
+        (let ((stream (spyglass--spawn
                        :name (format "spyglass-%s" host)
                        :command (append (list program) args
                                         (list "-o" "BatchMode=yes" "-W"
@@ -1387,7 +1594,7 @@ ARGS are extra options for PROGRAM."
                        :filter #'ignore :sentinel #'ignore :stderr sink)))
           (process-put stream 'spyglass-stderr sink)
           (funcall done stream token))
-      (error (spyglass--discard-process sink)
+      (error (spyglass--discard-sink sink)
              (funcall done nil (error-message-string err))))))
 
 (provide 'spyglass-conn)

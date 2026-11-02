@@ -62,6 +62,28 @@ Return PREDICATE's last value.  TIMEOUT defaults to 10 seconds."
     (while (< (float-time) end)
       (spyglass-test-step))))
 
+(defconst spyglass-test-lag-period 0.005
+  "Seconds between the ticks of the timer `spyglass-test-call-with-lag' runs.")
+
+(defun spyglass-test-call-with-lag (function)
+  "Call FUNCTION and return its value and how long Emacs ran no timer meanwhile.
+The value is (VALUE . SECONDS): SECONDS is the longest a timer due
+every `spyglass-test-lag-period' waited past its time, while FUNCTION
+waits with `spyglass-test-wait', say.  A step of Emacs's taking long,
+as a timer, sentinel or filter not returning, makes it wait."
+  (let* ((last (float-time))
+         (worst 0.0)
+         (timer (run-with-timer spyglass-test-lag-period spyglass-test-lag-period
+                                (lambda ()
+                                  (let ((now (float-time)))
+                                    (setq worst (max worst (- now last))
+                                          last now))))))
+    (unwind-protect
+        (let ((value (funcall function)))
+          (setq worst (max worst (- (float-time) last)))
+          (cons value (max 0.0 (- worst spyglass-test-lag-period))))
+      (cancel-timer timer))))
+
 (defun spyglass-test-runs (buffer &optional owner)
   "Return BUFFER's text and mirrored properties as a list of runs.
 Each run is (TEXT . PROPS), PROPS sanitized as a mirror keeps them.

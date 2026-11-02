@@ -27,6 +27,7 @@
 ;;; Code:
 
 (require 'spyglass-test-helpers)
+(require 'spyglass-transport-test)
 (require 'spyglass-bench)
 (require 'desktop)
 (require 'frameset)
@@ -419,6 +420,48 @@ visible frames only."
               (should (< (- (spyglass-bench-rss) before) (* 100 1024))))
             (kill-buffer mirror))
         (kill-buffer buffer)))))
+
+(ert-deftest spyglass-gui-attempts-never-block ()
+  "Attempts to connect, failing or not, never keep a graphical Emacs from running.
+The same attempts as `spyglass-transport-test.el''s, redisplaying
+between steps."
+  (spyglass-transport-test-with-ssh (ssh)
+    (let ((silent (spyglass-transport-test-silent-port))
+          (lags nil))
+      (unwind-protect
+          (cl-flet ((attempt (name transport predicate)
+                      (spyglass-transport-test-with ((spyglass-connect-timeout 1.0)
+                                                     (spyglass-reconnect-delays '(0.2)))
+                        (spyglass-test-start)
+                        (pcase-let ((`(,connection . ,lag)
+                                     (spyglass-transport-test-attempt
+                                      (funcall transport) predicate)))
+                          (should (funcall predicate connection))
+                          (push (format "%s %.1f ms" name (* 1000 lag)) lags)
+                          (should (< lag spyglass-transport-test-max-lag))))))
+            (attempt "refused"
+                     (lambda () (spyglass-tcp-transport "127.0.0.1" (spyglass-transport-test-closed-port) "t"))
+                     (spyglass-transport-test-reported "Cannot connect"))
+            (attempt "never answers"
+                     (lambda () (spyglass-tcp-transport "127.0.0.1" (car silent) "t"))
+                     (spyglass-transport-test-reported "timed out"))
+            (attempt "unresolvable"
+                     (lambda () (spyglass-tcp-transport "spyglass.invalid" 4000 "t"))
+                     (spyglass-transport-test-reported "cannot resolve"))
+            (attempt "connects"
+                     (lambda () (spyglass-file-transport spyglass-test--server-file))
+                     #'spyglass-connection-live-p)
+            (attempt "ssh, no server"
+                     (lambda () (spyglass-ssh-transport "peer" :program ssh
+                                                        :file "/nonexistent/server.json"))
+                     (spyglass-transport-test-reported "no spyglass server registered"))
+            (attempt "ssh connects"
+                     (lambda () (spyglass-ssh-transport "peer" :program ssh
+                                                        :file spyglass-test--server-file))
+                     #'spyglass-connection-live-p)
+            (message "GUI: longest wait during attempts: %s"
+                     (mapconcat #'identity (nreverse lags) ", ")))
+        (mapc #'delete-process (cdr silent))))))
 
 (defun spyglass-gui-test-run ()
   "Run the GUI tests, write their results to SPYGLASS_GUI_LOG, and exit.

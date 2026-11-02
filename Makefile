@@ -8,7 +8,9 @@
 # the Eat adapter; without it they are skipped.  GHOSTEL_EL and
 # GHOSTEL_MODULE_DIR locate Ghostel's Lisp and its native module;
 # VTERM_EL a directory holding vterm.el and its built module.  BENCH_REMOTE names an SSH host to run the
-# benchmarks against too, through BENCH_SSH.
+# benchmarks against too, through BENCH_SSH.  LAG_SSH_HOST names a host
+# reached through LAG_SSH without a prompt and sharing this file system,
+# as localhost, for the SSH scenarios of lag.
 
 EMACS ?= emacs
 TIMEOUT ?= 600
@@ -22,6 +24,8 @@ BENCH_SSH ?= ssh
 BENCH_REMOTE_EMACS ?= emacs
 BENCH_ONLY ?=
 BENCH_WINDOW ?=
+LAG_SSH ?= ssh
+LAG_SSH_HOST ?=
 
 # Stale byte code must never shadow an edited source, in builds or tests.
 PREFER_NEWER = --eval '(setq load-prefer-newer t)'
@@ -44,7 +48,7 @@ GUI_EMACS ?= $(EMACS)
 GUI_FLAGS ?= $(if $(filter Darwin,$(shell uname)),-ApplePersistenceIgnoreState YES)
 GUI_SELECTOR ?=
 
-.PHONY: all compile test test-gui lint bench clean
+.PHONY: all compile test test-gui lint bench lag lag-gui clean
 
 all: compile test
 
@@ -96,6 +100,24 @@ bench: compile
 	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" SPYGLASS_BENCH_ONLY="$(BENCH_ONLY)" \
 	SPYGLASS_BENCH_WINDOW="$(BENCH_WINDOW)" \
 	$(EMACS_BATCH) -l test/spyglass-bench.el -f spyglass-bench-main
+
+# Not part of test: how long attempts to connect, failing or not, keep
+# Emacs from running timers.  See test/spyglass-lag.el.
+lag: compile
+	$(NOPIPE) SPYGLASS_LAG_SSH="$(LAG_SSH)" SPYGLASS_LAG_SSH_HOST="$(LAG_SSH_HOST)" \
+	$(EMACS_BATCH) -l test/spyglass-lag.el -f spyglass-lag-main
+
+# The same in a graphical Emacs, started iconified as for test-gui,
+# waiting in its command loop as the user's does.
+lag-gui: compile
+	@$(NOPIPE) log=$$(mktemp); \
+	SPYGLASS_LAG_LOG=$$log SPYGLASS_LAG_SSH="$(LAG_SSH)" SPYGLASS_LAG_SSH_HOST="$(LAG_SSH_HOST)" \
+	timeout $(TIMEOUT) $(GUI_EMACS) -Q -iconic --chdir "$(CURDIR)" \
+	  --eval '(setq native-comp-jit-compilation nil load-prefer-newer t)' \
+	  -L . -L test \
+	  --eval '(condition-case err (progn (load "spyglass-lag") (run-with-timer 0.5 nil (function spyglass-lag-main))) (error (write-region (format "%S\n" err) nil (getenv "SPYGLASS_LAG_LOG")) (kill-emacs 2)))' \
+	  $(GUI_FLAGS); \
+	status=$$?; cat $$log; rm -f $$log; exit $$status
 
 clean:
 	rm -f *.elc test/*.elc
