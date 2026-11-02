@@ -85,7 +85,7 @@ The server binds 127.0.0.1 only; other hosts reach it through SSH. Clients must 
 
 * Performance
 
-The owner sends, for each viewer, the ranges it has not seen, read from the buffer when sent: a slow viewer costs bounded memory, and changes made meanwhile coalesce. Sending yields to the command loop every 4 ms. See [[file:doc/benchmarks.org][the benchmarks]], measured between two Emacs processes on one host and across hosts, with =make bench=.
+The owner sends, for each viewer, the ranges it has not seen, read from the buffer when sent: a slow viewer costs bounded memory, and changes made meanwhile coalesce. Sending yields to the command loop every 4 ms. Between two Emacs processes on one host, a 100 MB buffer opens in 0.7 s, 100 000 small appends and a 50 MB/s stream arrive exactly with 20–30 ms of median latency, and terminals rewritten 60 times a second cost about 1 ms a tick; across SSH from a Mac to a Windows host on the local network, the same, the stream included. See [[file:doc/benchmarks.org][the benchmarks]], measured with =make bench=.
 
 * Development
 
