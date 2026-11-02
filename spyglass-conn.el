@@ -101,6 +101,45 @@ STATE is one of `connecting', `open', `reconnecting' and `closed'.")
   "Abnormal hook run with (CONNECTION SHARES) when a peer's shares change.
 SHARES is the list returned by `spyglass-connection-shares'.")
 
+;;;; References
+
+;; Emacs prints a value whole wherever nothing bounds it: an error's
+;; data, what `format' and `prin1-to-string' are given, a value
+;; evaluated, the list of timers.  Without `print-circle', its printer
+;; prints a structure again from every path reaching it: when each of
+;; many structures leads back to what holds them all, as each pending
+;; request's timer led to its connection and so to every other request,
+;; each prints them all, and printing them grows with the square of
+;; their number.  What leads back up, from structures, closures, timers
+;; and the properties of processes, goes through references: uninterned
+;; symbols whose value is the target, which print as their name.
+
+(defsubst spyglass--ref (object)
+  "Return a reference to OBJECT, which prints as a name alone, or nil for nil.
+`spyglass--deref' returns OBJECT from it.  Each reference is new."
+  (when object
+    (let ((ref (make-symbol "spyglass-ref")))
+      (set ref object)
+      ref)))
+
+(defsubst spyglass--deref (ref)
+  "Return what REF, made by `spyglass--ref', leads to, or nil.
+What a spyglass predating references stored, the object itself, is
+returned as it is, so that a running Emacs loading this one keeps
+its connections."
+  (if (and ref (symbolp ref)) (symbol-value ref) ref))
+
+(defun spyglass--run-referenced (function ref)
+  "Call FUNCTION with what REF leads to, unless that is gone."
+  (when-let* ((object (spyglass--deref ref)))
+    (funcall function object)))
+
+(defun spyglass--run-with-timer (delay repeat function object)
+  "Call FUNCTION with OBJECT after DELAY seconds, then every REPEAT if non-nil.
+Return the timer, which holds OBJECT through a reference (see
+`spyglass--ref'), so that printing the timer prints a name."
+  (run-with-timer delay repeat #'spyglass--run-referenced function (spyglass--ref object)))
+
 (cl-defstruct (spyglass-connection (:constructor spyglass--make-connection)
                                    (:copier nil))
   "A connection to a peer, which outlives its streams."
@@ -118,7 +157,7 @@ SHARES is the list returned by `spyglass-connection-shares'.")
   (next-rid 0 :documentation "Last request identifier.")
   (requests nil :documentation "Alist of request identifiers and callbacks.")
   (shares nil :documentation "The peer's shares, as last announced.")
-  (mirrors nil :documentation "Hash table of subscription identifiers and mirror buffers.")
+  (mirrors nil :documentation "Hash table of subscription identifiers and mirrors.")
   (next-sub 0 :documentation "Last subscription identifier.")
   (last-recv 0.0 :documentation "When the peer was last heard from.")
   (last-send 0.0 :documentation "When something was last sent.")
@@ -187,6 +226,38 @@ neither of which may signal back here."
         (run-hook-with-args 'spyglass-connection-state-functions connection state)
       (error (message "spyglass: error in state hook: %S" err)))
     (spyglass--callback connection 'state state)))
+
+;;;; Samples
+
+(defun spyglass--ring (&optional size)
+  "Return an empty ring of SIZE (4096 by default) numbers.
+Its vector grows as samples come, up to SIZE, so that a ring holds,
+and prints, no more numbers than it was given."
+  (let ((size (or size 4096)))
+    (vector (make-vector (min 16 size) 0.0) 0 0 size)))
+
+(defun spyglass--ring-add (ring value)
+  "Add VALUE to RING."
+  (let* ((v (aref ring 0)) (i (aref ring 1))
+         ;; A ring made before rings grew is full size already.
+         (size (if (> (length ring) 3) (aref ring 3) (length v))))
+    (when (= i (length v))
+      (setq v (vconcat v (make-vector (min (length v) (- size (length v))) 0.0)))
+      (aset ring 0 v))
+    (aset v i value)
+    (aset ring 1 (% (1+ i) size))
+    (aset ring 2 (min size (1+ (aref ring 2))))))
+
+(defun spyglass-ring-summary (ring)
+  "Return the count, median, 99th percentile and maximum of RING, as a plist."
+  (let* ((n (aref ring 2))
+         (sorted (sort (cl-subseq (aref ring 0) 0 n) #'<)))
+    (if (zerop n)
+        (list :n 0)
+      (list :n n
+            :p50 (aref sorted (/ n 2))
+            :p99 (aref sorted (min (1- n) (floor (* n 0.99))))
+            :max (aref sorted (1- n))))))
 
 ;;;; Sending
 
@@ -318,13 +389,18 @@ connection ends first."
 
 ;;;; Receiving
 
+(defun spyglass--process-connection (process)
+  "Return the connection whose stream PROCESS is, or nil.
+The process holds it through a reference: see `spyglass--ref'."
+  (spyglass--deref (process-get process 'spyglass-connection)))
+
 (defun spyglass--filter (process chunk)
   "Feed CHUNK received on PROCESS to its connection.
 Frames are handled in the order received.  A handler may write, and
 a write waiting runs filters, this one too: frames it reads then are
 queued, and handled after those read before, by the call handling
 those."
-  (let ((connection (process-get process 'spyglass-connection)))
+  (let ((connection (spyglass--process-connection process)))
     (when (and connection (eq process (spyglass-connection-process connection)))
       (setf (spyglass-connection-last-recv connection) (float-time))
       (let ((frames
@@ -351,11 +427,11 @@ those."
         (while frames
           (dolist (frame frames)
             ;; The handshake may move the stream to another connection.
-            (let ((connection (process-get process 'spyglass-connection)))
+            (let ((connection (spyglass--process-connection process)))
               (when (and connection (eq process (spyglass-connection-process connection)))
                 (spyglass--guard connection
                   (spyglass--dispatch connection (car frame) (cdr frame))))))
-          (let ((connection (process-get process 'spyglass-connection)))
+          (let ((connection (spyglass--process-connection process)))
             (when (and connection (eq process (spyglass-connection-process connection)))
               (spyglass--guard connection
                 (run-hook-with-args 'spyglass--after-input-functions connection))))
@@ -467,7 +543,7 @@ resume."
     (if (not old)
         connection
       (let ((process (spyglass-connection-process connection)))
-        (process-put process 'spyglass-connection old)
+        (process-put process 'spyglass-connection (spyglass--ref old))
         (spyglass-wire-free-reader (spyglass-connection-reader old))
         (setf (spyglass-connection-process old) process
               (spyglass-connection-reader old) (spyglass-connection-reader connection)
@@ -579,7 +655,7 @@ dropped within that after TIMEOUT."
                         (spyglass-connection-label connection) problem
                         (car settings) (cdr settings)))
     (setf (spyglass-connection-timer connection)
-          (run-with-timer period period #'spyglass--heartbeat connection))))
+          (spyglass--run-with-timer period period #'spyglass--heartbeat connection))))
 
 (defun spyglass--heartbeat (connection)
   "Send a heartbeat on CONNECTION, or drop it when the peer went silent."
@@ -607,7 +683,7 @@ dropped within that after TIMEOUT."
   (set-process-query-on-exit-flag process nil)
   (set-process-filter process #'spyglass--filter)
   (set-process-sentinel process #'spyglass--sentinel)
-  (process-put process 'spyglass-connection connection)
+  (process-put process 'spyglass-connection (spyglass--ref connection))
   (spyglass-wire-free-reader (spyglass-connection-reader connection))
   (setf (spyglass-connection-process connection) process
         (spyglass-connection-reader connection) (spyglass-wire-make-reader)
@@ -617,7 +693,7 @@ dropped within that after TIMEOUT."
 
 (defun spyglass--sentinel (process _event)
   "Notice that PROCESS, a connection's stream, ended."
-  (let ((connection (process-get process 'spyglass-connection)))
+  (let ((connection (spyglass--process-connection process)))
     (when (and connection (not (process-live-p process))
                (eq process (spyglass-connection-process connection)))
       (spyglass--guard connection
@@ -681,8 +757,8 @@ Return what it wrote to standard error, trimmed, or nil."
         (spyglass--guard connection (funcall f connection nil)))
       (spyglass--set-state connection 'reconnecting)
       (setf (spyglass-connection-timer connection)
-            (run-with-timer spyglass-heartbeat-timeout nil
-                            #'spyglass--expire connection)))
+            (spyglass--run-with-timer spyglass-heartbeat-timeout nil
+                                      #'spyglass--expire connection)))
      (t
       (spyglass--close-final connection)))))
 
@@ -706,7 +782,7 @@ Return what it wrote to standard error, trimmed, or nil."
          (delay (if (< n (length delays)) (nth n delays) (car (last delays)))))
     (spyglass--cancel-timer connection)
     (setf (spyglass-connection-timer connection)
-          (run-with-timer delay nil #'spyglass--reconnect connection))))
+          (spyglass--run-with-timer delay nil #'spyglass--reconnect connection))))
 
 (defun spyglass--reconnect (connection)
   "Make a new stream for CONNECTION through its transport."
@@ -717,8 +793,11 @@ Return what it wrote to standard error, trimmed, or nil."
     (spyglass--open-stream connection)))
 
 (defun spyglass--open-stream (connection)
-  "Ask CONNECTION's transport for a stream, and start the handshake on it."
+  "Ask CONNECTION's transport for a stream, and start the handshake on it.
+The function the transport is given, which a process of its may hold
+until it calls it, holds CONNECTION through a reference."
   (let ((transport (spyglass-connection-transport connection))
+        (ref (spyglass--ref connection))
         (done nil))
     (condition-case err
         (funcall
@@ -727,22 +806,23 @@ Return what it wrote to standard error, trimmed, or nil."
            (if done
                (when (processp process) (delete-process process))
              (setq done t)
-             (spyglass--guard connection
-               (cond
-                ((or (spyglass-connection-closing connection)
-                     (eq (spyglass-connection-state connection) 'closed))
-                 (when (processp process) (delete-process process)))
-                ((not (processp process))
-                 (spyglass--report connection "Cannot connect to %s: %s"
-                                   (spyglass-connection-label connection)
-                                   (or token "no stream"))
-                 (spyglass--set-state connection 'reconnecting)
-                 (spyglass--schedule-reconnect connection))
-                (t
-                 (setf (spyglass-connection-token connection) token)
-                 (spyglass--attach-process connection process)
-                 (spyglass--hello connection)
-                 (spyglass--watch-handshake connection process)))))))
+             (let ((connection (spyglass--deref ref)))
+               (spyglass--guard connection
+                 (cond
+                  ((or (spyglass-connection-closing connection)
+                       (eq (spyglass-connection-state connection) 'closed))
+                   (when (processp process) (delete-process process)))
+                  ((not (processp process))
+                   (spyglass--report connection "Cannot connect to %s: %s"
+                                     (spyglass-connection-label connection)
+                                     (or token "no stream"))
+                   (spyglass--set-state connection 'reconnecting)
+                   (spyglass--schedule-reconnect connection))
+                  (t
+                   (setf (spyglass-connection-token connection) token)
+                   (spyglass--attach-process connection process)
+                   (spyglass--hello connection)
+                   (spyglass--watch-handshake connection process))))))))
       (error
        (setq done t)
        (spyglass--report connection "Transport failed: %s" (error-message-string err))
@@ -751,12 +831,14 @@ Return what it wrote to standard error, trimmed, or nil."
 
 (defun spyglass--watch-handshake (connection process)
   "Drop PROCESS if CONNECTION's handshake on it does not finish in time."
-  (run-with-timer spyglass-handshake-timeout nil
-                  (lambda ()
-                    (when (and (eq process (spyglass-connection-process connection))
-                               (not (spyglass-connection-authenticated connection)))
-                      (spyglass--report connection "Handshake timed out")
-                      (spyglass--drop connection)))))
+  (let ((ref (spyglass--ref connection)))
+    (run-with-timer spyglass-handshake-timeout nil
+                    (lambda ()
+                      (let ((connection (spyglass--deref ref)))
+                        (when (and (eq process (spyglass-connection-process connection))
+                                   (not (spyglass-connection-authenticated connection)))
+                          (spyglass--report connection "Handshake timed out")
+                          (spyglass--drop connection)))))))
 
 ;;;; Public functions
 

@@ -235,11 +235,14 @@ against `spyglass-channel-window' until acknowledged."
   (let ((link (spyglass--link connection)))
     (unless (spyglass--link-timer link)
       (setf (spyglass--link-timer link)
-            (run-at-time (or delay 0) nil
-                         (lambda ()
-                           (setf (spyglass--link-timer link) nil)
-                           (spyglass--guard connection
-                             (spyglass--channel-pump connection))))))))
+            (spyglass--run-with-timer (or delay 0) nil #'spyglass--channel-tick connection)))))
+
+(defun spyglass--channel-tick (connection)
+  "Send CONNECTION's queue, from the timer `spyglass--channel-schedule' made."
+  (when-let* ((link (gethash connection spyglass--links)))
+    (setf (spyglass--link-timer link) nil))
+  (spyglass--guard connection
+    (spyglass--channel-pump connection)))
 
 (defun spyglass--channel-pump (connection)
   "Send what CONNECTION's queue may send now, for a tick at most.
@@ -348,7 +351,11 @@ no channel answers there, when TIMEOUT seconds passed, by default
 Return the request's identifier, or nil when it could not be sent, in
 which case CALLBACK has been called already: the connection is not
 open, its peer has no channels or the message is too large."
+  ;; The connection holds the request until answered, and the request
+  ;; its timer: both lead back to the connection through a reference,
+  ;; lest each print the connection with every other request.
   (let* ((rid (cl-incf (spyglass-connection-next-rid connection)))
+         (ref (spyglass--ref connection))
          (done nil)
          (timer nil)
          (deliver (lambda (reply error)
@@ -357,7 +364,8 @@ open, its peer has no channels or the message is too large."
                       (when timer (cancel-timer timer))
                       (condition-case err
                           (funcall callback reply error)
-                        (error (spyglass--report connection "Error in reply callback: %s"
+                        (error (spyglass--report (spyglass--deref ref)
+                                                 "Error in reply callback: %s"
                                                  (error-message-string err))))))))
     ;; Kept with spyglass's requests: a stream ending answers them nil.
     (push (cons rid (lambda (header)
@@ -367,8 +375,9 @@ open, its peer has no channels or the message is too large."
           (spyglass-connection-requests connection))
     (setq timer (run-at-time (or timeout spyglass-channel-request-timeout) nil
                              (lambda ()
-                               (spyglass--answer connection rid
-                                                 (list :error "no answer in time")))))
+                               (when-let* ((connection (spyglass--deref ref)))
+                                 (spyglass--answer connection rid
+                                                   (list :error "no answer in time"))))))
     (if (spyglass--channel-send-bytes connection channel (list :rq rid)
                                       (spyglass-channel-encode message))
         rid
@@ -420,6 +429,7 @@ open, its peer has no channels or the message is too large."
             (spyglass--answer connection answer reply)))))
      ((natnump rid)
       (let ((handler (plist-get entry :request))
+            (ref (spyglass--ref connection))
             (answered nil))
         (if (not (functionp handler))
             (spyglass--channel-reply connection channel rid nil
@@ -427,11 +437,15 @@ open, its peer has no channels or the message is too large."
                                              (spyglass-wire-plain-string (format "%s" channel))))
           (condition-case err
               (funcall handler connection (spyglass-channel-decode (or bytes "null"))
+                       ;; The application may keep it, in a timer for
+                       ;; instance: it leads to the connection through a
+                       ;; reference.
                        (lambda (reply &optional error)
                          (unless answered
                            (setq answered t)
-                           (when (spyglass-connection-live-p connection)
-                             (spyglass--channel-reply connection channel rid reply error)))))
+                           (let ((connection (spyglass--deref ref)))
+                             (when (spyglass-connection-live-p connection)
+                               (spyglass--channel-reply connection channel rid reply error))))))
             (error
              (unless answered
                (setq answered t)

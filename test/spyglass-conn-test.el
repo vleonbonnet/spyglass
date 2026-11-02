@@ -391,6 +391,19 @@ the mirrors end exact, without an error or the stream ever breaking."
               (ignore-errors (spyglass-unshare buffer))
               (kill-buffer buffer))))))))
 
+(ert-deftest spyglass-conn-references ()
+  "A reference prints as a name and leads to its target.
+What a spyglass predating references stored, the target itself, is
+taken as it is."
+  (let* ((connection (spyglass--make-connection :name "referenced"))
+         (ref (spyglass--ref connection)))
+    (should (eq (spyglass--deref ref) connection))
+    (should (equal (prin1-to-string ref) "spyglass-ref"))
+    (should-not (eq ref (spyglass--ref connection)))
+    (should-not (spyglass--ref nil))
+    (should-not (spyglass--deref nil))
+    (should (eq (spyglass--deref connection) connection))))
+
 (ert-deftest spyglass-conn-heartbeat-settings ()
   "Heartbeats take integers and floats, and refuse what makes no heartbeat.
 A connection is looked at every half of the shorter of the interval

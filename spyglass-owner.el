@@ -182,30 +182,6 @@ Terminal adapters return the terminal's cursor.")
   "The share of this buffer, or nil.")
 (put 'spyglass--share 'permanent-local t)
 
-;;;; Samples
-
-(defun spyglass--ring (&optional size)
-  "Return an empty ring of SIZE (4096 by default) numbers."
-  (vector (make-vector (or size 4096) 0.0) 0 0))
-
-(defun spyglass--ring-add (ring value)
-  "Add VALUE to RING."
-  (let ((v (aref ring 0)) (i (aref ring 1)))
-    (aset v i value)
-    (aset ring 1 (% (1+ i) (length v)))
-    (aset ring 2 (min (length v) (1+ (aref ring 2))))))
-
-(defun spyglass-ring-summary (ring)
-  "Return the count, median, 99th percentile and maximum of RING, as a plist."
-  (let* ((n (aref ring 2))
-         (sorted (sort (cl-subseq (aref ring 0) 0 n) #'<)))
-    (if (zerop n)
-        (list :n 0)
-      (list :n n
-            :p50 (aref sorted (/ n 2))
-            :p99 (aref sorted (min (1- n) (floor (* n 0.99))))
-            :max (aref sorted (1- n))))))
-
 ;;;; Records
 
 (cl-defstruct (spyglass-share (:constructor spyglass--make-share)
@@ -257,13 +233,33 @@ Terminal adapters return the terminal's cursor.")
 
 (cl-defstruct (spyglass--sub (:constructor spyglass--make-sub) (:copier nil))
   "A viewer's subscription to a share."
-  key id connection share epoch
+  key id
+  (connection-ref nil :documentation "A reference to the viewer's connection, see `spyglass--sub-connection'.")
+  (share-ref nil :documentation "A reference to the share, see `spyglass--sub-share'.")
+  epoch
   (seq 0) (acked 0) (inflight 0) unacked
   intervals ct reset
   styles (next-style 0) faces ov-dirty
   point window-start meta orphaned
   (size nil :documentation "Cells (COLS . ROWS) of the viewer's window, or nil.")
   (active 0.0 :documentation "When the viewer last typed or selected its mirror."))
+
+;; A subscription leads to its share and its connection through
+;; references (see `spyglass--ref'): the share holds all its
+;; subscriptions, and each printed them all again.
+
+(defun spyglass--sub-connection (sub)
+  "Return the connection of SUB's viewer, or nil while it is away."
+  (spyglass--deref (spyglass--sub-connection-ref sub)))
+
+(gv-define-setter spyglass--sub-connection (connection sub)
+  (macroexp-let2 nil connection connection
+    `(progn (setf (spyglass--sub-connection-ref ,sub) (spyglass--ref ,connection))
+            ,connection)))
+
+(defun spyglass--sub-share (sub)
+  "Return the share SUB subscribes to."
+  (spyglass--deref (spyglass--sub-share-ref sub)))
 
 (defvar spyglass--sub-functions nil
   "Functions called with (SUB EVENT) on a subscription's events.
@@ -1409,7 +1405,8 @@ just captured."
   (unless (spyglass-share-mode share)
     (spyglass--activate share))
   (let ((sub (spyglass--make-sub
-              :key key :id id :connection connection :share share
+              :key key :id id :connection-ref (spyglass--ref connection)
+              :share-ref (spyglass--ref share)
               :epoch (substring (spyglass-wire-random-token) 0 16)
               :reset t :styles (make-hash-table :test #'equal)
               :faces (make-hash-table :test #'eq)

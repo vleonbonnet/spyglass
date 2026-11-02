@@ -220,10 +220,10 @@
   "Each policy picks its size among the owner's and the viewers'."
   (let* ((share (spyglass--make-share :id "p" :buffer (current-buffer)))
          (connection (spyglass--make-connection :state 'open))
-         (a (spyglass--make-sub :connection connection :share share
-                                :size '(100 . 30) :active 10.0))
-         (b (spyglass--make-sub :connection connection :share share
-                                :size '(80 . 40) :active 20.0)))
+         (a (spyglass--make-sub :connection-ref (spyglass--ref connection)
+                                :share-ref (spyglass--ref share) :size '(100 . 30) :active 10.0))
+         (b (spyglass--make-sub :connection-ref (spyglass--ref connection)
+                                :share-ref (spyglass--ref share) :size '(80 . 40) :active 20.0)))
     (cl-letf (((symbol-function 'spyglass--sub-live-p) (lambda (_) t)))
       (setf (spyglass-share-subs share) (list a b)
             (spyglass-share-owner-active share) 15.0)

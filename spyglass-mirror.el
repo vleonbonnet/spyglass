@@ -82,7 +82,8 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
                                (:conc-name spyglass--mirror-)
                                (:copier nil))
   "A mirror of a peer's shared buffer."
-  (connection nil :documentation "The connection to the owner.")
+  (connection-ref nil :documentation "A reference to the connection to the owner.
+See `spyglass--mirror-connection'.")
   (id nil :documentation "Subscription identifier, unique on the connection.")
   (share nil :documentation "The share's identifier.")
   (buffer nil :documentation "The mirror buffer.")
@@ -105,6 +106,13 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
   (grid nil :documentation "The owner's terminal size, (COLUMNS . ROWS), or nil.")
   (sent-size nil :documentation "Window size last reported to the owner, or nil.")
   (stats nil :documentation "Plist of counters and samples."))
+
+(defun spyglass--mirror-connection (mirror)
+  "Return MIRROR's connection to its owner.
+MIRROR holds it through a reference (see `spyglass--ref'): the
+connection holds all its mirrors, which each printed again from every
+mirror."
+  (spyglass--deref (spyglass--mirror-connection-ref mirror)))
 
 (defvar-local spyglass--mirror nil
   "The mirror shown in this buffer.")
@@ -142,13 +150,10 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
   "Add VALUE to MIRROR's ring of samples KEY."
   (let ((ring (plist-get (spyglass--mirror-stats mirror) key)))
     (unless ring
-      (setq ring (vector (make-vector 4096 0.0) 0 0))
+      (setq ring (spyglass--ring))
       (setf (spyglass--mirror-stats mirror)
             (plist-put (spyglass--mirror-stats mirror) key ring)))
-    (let ((v (aref ring 0)) (i (aref ring 1)))
-      (aset v i value)
-      (aset ring 1 (% (1+ i) (length v)))
-      (aset ring 2 (min (length v) (1+ (aref ring 2)))))))
+    (spyglass--ring-add ring value)))
 
 (defun spyglass-mirror-stats (mirror-or-buffer)
   "Return the counters and summarized samples of MIRROR-OR-BUFFER.
@@ -159,12 +164,7 @@ here, through the estimated clock offset)."
     (cl-loop for (key value) on (spyglass--mirror-stats mirror) by #'cddr
              do (setq out (plist-put out key
                                      (if (vectorp value)
-                                         (let* ((n (aref value 2))
-                                                (s (sort (cl-subseq (aref value 0) 0 n) #'<)))
-                                           (if (zerop n) (list :n 0)
-                                             (list :n n :p50 (aref s (/ n 2))
-                                                   :p99 (aref s (min (1- n) (floor (* n 0.99))))
-                                                   :max (aref s (1- n)))))
+                                         (spyglass-ring-summary value)
                                        value))))
     out))
 
@@ -269,7 +269,7 @@ returns that mirror's buffer."
       (let* ((buffer (generate-new-buffer
                       (or buffer-name (spyglass--mirror-name share-id connection))))
              (mirror (spyglass--make-mirror
-                      :connection connection
+                      :connection-ref (spyglass--ref connection)
                       :id (cl-incf (spyglass-connection-next-sub connection))
                       :share share-id :buffer buffer :callback callback
                       :styles (make-hash-table :test #'eql)

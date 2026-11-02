@@ -103,6 +103,21 @@ Intervals are applied from the last, as the owner sends them."
           (should-error (spyglass-share (current-buffer) :id "same"))))
     (spyglass-test-stop)))
 
+(ert-deftest spyglass-owner-ring-grows ()
+  "A ring's vector grows with its samples up to its size, then wraps.
+Empty rings were made whole, 4096 numbers each, which every share and
+mirror printed with its statistics."
+  (let ((ring (spyglass--ring 40)))
+    (should (<= (length (aref ring 0)) 16))
+    (should (equal (spyglass-ring-summary ring) '(:n 0)))
+    (dotimes (i 10) (spyglass--ring-add ring (float i)))
+    (should (<= (length (aref ring 0)) 16))
+    (should (equal (spyglass-ring-summary ring) '(:n 10 :p50 5.0 :p99 9.0 :max 9.0)))
+    (dotimes (i 100) (spyglass--ring-add ring (float (+ 100 i))))
+    (should (= (length (aref ring 0)) 40))
+    (should (equal (spyglass-ring-summary ring) '(:n 40 :p50 180.0 :p99 199.0 :max 199.0)))
+    (should (= (apply #'min (append (aref ring 0) nil)) 160.0))))
+
 (ert-deftest spyglass-owner-accessors-are-not-shadowed ()
   "No function of spyglass takes the name of a structure's accessor."
   (dolist (type '(spyglass-share spyglass--sub spyglass-connection spyglass-server
