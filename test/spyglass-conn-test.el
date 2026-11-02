@@ -166,11 +166,43 @@ The update reaches the mirror while its end writes the frame."
             (should (equal answer '((:ok t) nil))))
         (spyglass-unregister-channel "tst")))))
 
+(ert-deftest spyglass-conn-frames-handled-in-order ()
+  "Frames read while a handler's write waits are handled after those before them.
+A handler of the first of two frames read together writes a frame far
+larger than the sockets' buffers; while it waits, a third frame
+arrives, and Emacs runs the filter again: it must wait for the second."
+  (spyglass-conn-test--with (client server)
+    (let ((order nil) (fired nil))
+      (spyglass--register-handler
+       "ord" (lambda (connection header _payload)
+               (when (eq connection client)
+                 (push (plist-get header :n) order)
+                 (when (eql (plist-get header :n) 1)
+                   (run-at-time 0 nil (lambda ()
+                                        (setq fired t)
+                                        (spyglass--send server (list :t "ord" :n 3))))
+                   (spyglass--send-frame
+                    client (spyglass-wire-frame-parts
+                            (list :t "tst" :n 1)
+                            (list (make-string spyglass-conn-test--part-size ?a)
+                                  (make-string spyglass-conn-test--part-size ?b))))))))
+      (unwind-protect
+          (progn
+            ;; One write: both frames reach the client in one chunk.
+            (should (spyglass--send-frame server
+                                          (concat (spyglass-wire-frame (list :t "ord" :n 1))
+                                                  (spyglass-wire-frame (list :t "ord" :n 2)))))
+            (spyglass-test-wait (lambda () (>= (length order) 3)) 30)
+            (should fired)
+            (should (equal (reverse order) '(1 2 3)))
+            (spyglass-conn-test--check-large server '(1)))
+        (remhash "ord" spyglass--handlers)))))
+
 (ert-deftest spyglass-conn-queue-bounded ()
-  "A peer making frames wait past `spyglass-send-queue-limit' loses its stream.
+  "A peer making frames wait past `spyglass-queue-limit' loses its stream.
 It sends pings while not reading the frame written to it."
   (spyglass-conn-test--with (client server)
-    (let* ((spyglass-send-queue-limit 2000)
+    (let* ((spyglass-queue-limit 2000)
            (states nil)
            (spyglass-connection-state-functions
             (cons (lambda (c state) (when (eq c client) (push state states)))
@@ -179,12 +211,41 @@ It sends pings while not reading the frame written to it."
       (spyglass--send-frame client (spyglass-wire-frame-parts
                                     (list :t "tst" :n 1)
                                     (list (make-string spyglass-conn-test--part-size ?a))))
-      (should (seq-some (lambda (m) (string-match-p "reads too slowly" m)) spyglass-test-errors))
+      (should (seq-some (lambda (m) (string-match-p "wait to be sent" m)) spyglass-test-errors))
       (should (memq 'reconnecting states))
       ;; Not reported: the stream was dropped on purpose.
       (should-not (seq-some (lambda (m) (string-match-p "Sending failed" m)) spyglass-test-errors))
       (spyglass-test-wait (lambda () (spyglass-connection-live-p client)) 10)
       (should (spyglass-connection-live-p client)))))
+
+(ert-deftest spyglass-conn-inbox-bounded ()
+  "A peer sending past `spyglass-queue-limit' while its frames wait loses its stream.
+They wait while a handler's write waits for the peer to read."
+  (spyglass-conn-test--with (client server)
+    (let* ((spyglass-queue-limit 20000)
+           (states nil)
+           (spyglass-connection-state-functions
+            (cons (lambda (c state) (when (eq c client) (push state states)))
+                  spyglass-connection-state-functions)))
+      (spyglass--register-handler
+       "ord" (lambda (connection _header _payload)
+               (when (eq connection client)
+                 (run-at-time 0 nil (lambda ()
+                                      (dotimes (n 100)
+                                        (spyglass--send server (list :t "ord" :n n)
+                                                        (make-string 1000 ?x)))))
+                 (spyglass--send-frame
+                  client (spyglass-wire-frame-parts
+                          (list :t "tst" :n 1)
+                          (list (make-string spyglass-conn-test--part-size ?a)))))))
+      (unwind-protect
+          (progn
+            (spyglass--send server (list :t "ord" :n 0))
+            (spyglass-test-wait (lambda () (memq 'reconnecting states)) 30)
+            (should (seq-some (lambda (m) (string-match-p "wait to be handled" m))
+                              spyglass-test-errors))
+            (should (memq 'reconnecting states)))
+        (remhash "ord" spyglass--handlers)))))
 
 (defun spyglass-conn-test--fill (buffer lines tag)
   "Add LINES lines tagged TAG to BUFFER, with faces now and then.
