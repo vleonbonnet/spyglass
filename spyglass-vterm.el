@@ -21,11 +21,16 @@
 ;; `put-text-property', which run modification hooks, so spyglass
 ;; captures it without help; its colors are `font-lock-face'
 ;; properties, mirrored as faces.  This adapter makes viewers type
-;; through vterm's key translation.  Loaded with vterm by spyglass.el.
+;; through vterm's key translation.  vterm sizes its terminal through
+;; its process's `adjust-window-size-function', which asks
+;; `window-adjust-process-window-size-function': viewers' sizes reach
+;; it there, and `spyglass-refit-process' applies them to a terminal
+;; no window shows.  Loaded with vterm by spyglass.el.
 
 ;;; Code:
 
 (require 'spyglass-owner)
+(require 'spyglass-window)
 
 (defvar vterm--term)
 (declare-function vterm-send-string "vterm" (string &optional paste-p))
@@ -41,10 +46,11 @@
    (t (vterm-send value))))
 
 (defun spyglass-vterm--setup (share)
-  "Set the input of SHARE when it is a vterm terminal."
+  "Set the input and size of SHARE when it is a vterm terminal."
   (with-current-buffer (spyglass-share-buffer share)
     (when (derived-mode-p 'vterm-mode)
-      (setq-local spyglass-input-function #'spyglass-vterm--input))))
+      (setq-local spyglass-input-function #'spyglass-vterm--input
+                  spyglass-refit-function #'spyglass-refit-process))))
 
 (add-hook 'spyglass-share-functions #'spyglass-vterm--setup)
 

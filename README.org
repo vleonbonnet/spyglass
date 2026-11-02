@@ -7,7 +7,7 @@ It is a library: it knows nothing of what the buffers hold. A session manager su
 
 * Requirements
 
-- Emacs 30.1 or later, for its built-in JSON parser; tested on 31.1 on macOS and on Windows (MSYS2 UCRT64). No other package.
+- Emacs 30.1 or later, for its built-in JSON parser; tested on 31.1 on macOS (the Mac port) and on Windows (MSYS2 UCRT64), and on 30.2 with Cocoa. No other package.
 - For another host: an SSH client whose =-W= forwards standard input and output to a port (OpenSSH, including Windows's OpenSSH server), and a shell there knowing =cat=.
 - Optionally Eat, Ghostel or vterm on the owner: their adapters load with them.
 
@@ -41,7 +41,7 @@ The server listens on 127.0.0.1 only and writes its port and a random token to =
 
 ** In a mirror
 
-Printing characters, =RET=, =TAB=, =DEL=, the arrows and =ESC= go to the owner; =C-c C-c=, =C-c C-d=, =C-c C-z= and =C-c C-j= send control characters, =C-c C-q= the next key, =C-c C-s= a string; =C-c C-f= toggles following the owner's cursor; =C-c C-k= closes the mirror. The header line tells where the mirror comes from and whether it is live, reconnecting or closed.
+Printing characters, =RET=, =TAB=, =DEL=, the arrows and =ESC= go to the owner; =C-c C-c=, =C-c C-d=, =C-c C-z= and =C-c C-j= send control characters, =C-c C-q= the next key, =C-c C-s= a string; =C-c C-f= toggles following the owner's cursor; =C-c C-k= closes the mirror. The header line tells where the mirror comes from, whether it is live, reconnecting or closed, and the size of a terminal.
 
 * API
 
@@ -49,13 +49,17 @@ Nothing below prompts; every function returns at once, and what happens on the n
 
 ** Sharing
 
-- =(spyglass-share &optional BUFFER &key ID READ-ONLY INPUT CAPTURE)= :: Share BUFFER (default: current) under ID (default: its name) and return the share. READ-ONLY refuses input; INPUT is a function applying viewers' input instead of the default; CAPTURE is =auto=, =shadow= or =direct= (see [[file:doc/design.org][the design notes]]). Sharing again updates the options given. Mirrors are never shared.
+- =(spyglass-share &optional BUFFER &key ID READ-ONLY INPUT CAPTURE NEEDS-WINDOW)= :: Share BUFFER (default: current) under ID (default: its name) and return the share. READ-ONLY refuses input; INPUT is a function applying viewers' input instead of the default; CAPTURE is =auto=, =shadow= or =direct= (see [[file:doc/design.org][the design notes]]); NEEDS-WINDOW non-nil parks the buffer while viewers watch it and no window shows it (see [[*Terminals][Terminals]]), =auto= (the default) asks the buffer's =spyglass-needs-window=. Sharing again updates the options given. Mirrors are never shared.
 - =(spyglass-unshare BUFFER-OR-SHARE)= :: Stop sharing; viewers' mirrors close with the reason "unshared". Killing a shared buffer does the same ("killed").
 - =(spyglass-shares)=, =(spyglass-share-of BUFFER)=, =(spyglass-share-viewers SHARE)=, =(spyglass-share-stats SHARE)= :: Shares, a buffer's share, its subscriptions, its counters and samples (main-thread ticks, latencies, bytes).
 - =(spyglass-notify &optional BUFFER BEG END PROPS-ONLY)= :: Tell spyglass that BUFFER changed between BEG and END without modification hooks. Code writing with =inhibit-modification-hooks= bound should call it, as the Eat and Ghostel adapters do; without it changes are still found, by comparing the whole buffer at most every ten times the cost of a comparison.
 - =spyglass-input-function= (buffer-local) :: How viewers' input applies in this buffer: a function of (KIND VALUE), KIND =string= with text or =key= with a key such as ="RET"=. Adapters set it; =spyglass-default-input= types into comint buffers, sends to processes as a terminal would, or inserts at point.
 - =spyglass-submit-function= (buffer-local) :: The command RET runs in a comint buffer, =comint-send-input= by default; a front end such as agent-shell sets =agent-shell-submit= here.
 - =spyglass-point-function= (buffer-local) :: The position viewers follow, point by default; terminal adapters give the terminal's cursor.
+- =spyglass-needs-window=, =spyglass-park-function= (buffer-local) :: The buffer changes only while a window shows it; the function run once it is parked. Ghostel's adapter sets them.
+- =spyglass-refit-function=, =spyglass-terminal-size-function= (buffer-local) :: Non-nil makes the share a terminal its viewers size: a function making the terminal take its size again, which it finds through =window-adjust-process-window-size-function=, and one returning its size =(COLUMNS . ROWS)=. =spyglass-refit-process= suits terminals sizing their process through its =adjust-window-size-function=, as Eat and vterm do; a comint buffer in a pty may set it too.
+- =spyglass-size-policy= :: Whose window sizes a terminal several parties show: =latest= (the default), =smallest= or =owner=. =spyglass-max-terminal-size= bounds what viewers may ask for.
+- =(spyglass-parking-frame-p FRAME)=, =(spyglass-window-cells WINDOW)= :: Whether FRAME is a parking frame, for code walking frames; the size of WINDOW in cells, as terminals and viewers count it.
 - =spyglass-share-functions=, =spyglass-share-state-functions= :: Hooks run on each new share, and on a share's events (=subscribed=, =unsubscribed=, =unshared=).
 
 ** Connecting
@@ -63,7 +67,7 @@ Nothing below prompts; every function returns at once, and what happens on the n
 - =(spyglass-server-start &key PORT FILE)=, =(spyglass-server-stop)=, =(spyglass-server)= :: The listener on 127.0.0.1, its registration file, the running server.
 - =(spyglass-connect TRANSPORT &key NAME CALLBACK PLIST)= :: Connect through TRANSPORT and return the connection, which connects again whenever its stream breaks, until =spyglass-disconnect=. CALLBACK gets =(CONNECTION EVENT DATA)= for =state=, =error= and =shares=.
 - Transports: =(spyglass-ssh-transport HOST &key PROGRAM FILE ARGS)=, =(spyglass-file-transport &optional FILE)= for this host, =(spyglass-tcp-transport HOST PORT TOKEN)=. A transport is any function called with a continuation DONE, which it calls with a process streaming to the peer's server and the token, or with nil and a message; drover can supply its own.
-- =(spyglass-disconnect CONNECTION)=, =(spyglass-connections)=, =(spyglass-connection-state CONNECTION)= (=connecting=, =open=, =reconnecting=, =closed=), =(spyglass-connection-shares CONNECTION)=, =(spyglass-list-shares CONNECTION CALLBACK)=, =(spyglass-connection-label CONNECTION)=.
+- =(spyglass-disconnect CONNECTION)=, =(spyglass-connections)=, =(spyglass-connection-state CONNECTION)= (=connecting=, =open=, =reconnecting=, =closed=), =(spyglass-connection-shares CONNECTION)=, =(spyglass-list-shares CONNECTION CALLBACK)=, =(spyglass-connection-label CONNECTION)=, =(spyglass-connection-capable-p CONNECTION CAPABILITY)=.
 - =spyglass-connection-state-functions=, =spyglass-shares-changed-functions=, =spyglass-error-functions= :: Hooks on every connection's state, a peer's shares, and errors.
 
 ** Mirrors
@@ -74,14 +78,19 @@ Nothing below prompts; every function returns at once, and what happens on the n
 - =(spyglass-mirror-send-string STRING &optional BUFFER)=, =(spyglass-mirror-send-key KEY &optional BUFFER)= :: Send input to the owner. The owner's refusals come back through the mirror's callback and =spyglass-error-functions=.
 - =spyglass-mirror-state-functions= :: Hook run with (BUFFER STATE).
 - =spyglass-mirror-follow=, =spyglass-mirror-show-cursor= :: Follow and show the owner's cursor.
+- =spyglass-mirror-size-delay= :: Seconds changes of windows gather before mirrors of terminals report their size.
 
 * Terminals
 
-Eat and Ghostel write their buffers with modification hooks inhibited; their adapters, loaded with them, tell spyglass the range written after each redraw, give the terminal's cursor and type through the terminal's own key handling. vterm's module writes with hooks; its adapter types through vterm's key translation. Ghostel renders only buffers shown in a window: a hidden Ghostel terminal on the owner does not change, nor do its mirrors. A terminal mirror is text and faces: the viewer's window size does not resize the owner's terminal.
+Eat and Ghostel write their buffers with modification hooks inhibited; their adapters, loaded with them, tell spyglass the range written after each redraw, give the terminal's cursor and type through the terminal's own key handling. vterm's module writes with hooks; its adapter types through vterm's key translation.
+
+Ghostel renders a terminal only through a window showing it. While viewers watch a Ghostel terminal and no window shows it on the owner, spyglass shows it in a /parking frame/: an invisible frame of its own on the owner's graphical display, never made visible, never focused, out of =other-frame=, desktops and tab bars, deleted as soon as a window shows the buffer, the buffer is unshared or killed, or the last viewer leaves. Redisplay does not draw it. An Emacs with no graphical frame (a daemon serving terminals only) cannot park: a hidden Ghostel terminal stands still there. Eat and vterm update without windows and are never parked.
+
+A terminal has one size, laid out for by the programs in it. Viewers report the size of the window showing their mirror, in cells of their own font, when it opens and whenever it changes, and the owner's terminal takes the size =spyglass-size-policy= picks: by default that of the last party to type into it or select it, the owner included, as tmux's =latest=; =smallest= and =owner= are the alternatives. The owner's windows are never resized: while a viewer's size wins, they show the terminal at that size, until the owner types or selects it there again. A parked terminal is sized through its parking window; Eat's and vterm's through their resize functions, shown or not. Peers of an older version neither send sizes nor receive them, and work as before.
 
 * Security
 
-The server binds 127.0.0.1 only; other hosts reach it through SSH. Clients must present the 256-bit token of the registration file, compared in constant time. Frames are limited to 64 KB before authentication and 64 MB after. Nothing received is ever read or evaluated: headers are JSON, Lisp values in them are decoded as data, and the viewer reduces every face, display specification and string to forms redisplay shows without evaluating anything (no images, no =:eval=, no =when=, no function as a height). Input from a viewer reaches only the share's input function, and a share made =:read-only= refuses it.
+The server binds 127.0.0.1 only; other hosts reach it through SSH. Clients must present the 256-bit token of the registration file, compared in constant time. Frames are limited to 64 KB before authentication and 64 MB after. Nothing received is ever read or evaluated: headers are JSON, Lisp values in them are decoded as data, and the viewer reduces every face, display specification and string to forms redisplay shows without evaluating anything (no images, no =:eval=, no =when=, no function as a height). Input from a viewer reaches only the share's input function, and a share made =:read-only= refuses it. Sizes a viewer reports are bounded by =spyglass-max-terminal-size=: a parked window of 500×200 cells, the default bound, holds about 50 MB.
 
 * Performance
 
@@ -92,6 +101,7 @@ The owner sends, for each viewer, the ranges it has not seen, read from the buff
 #+begin_src sh
   make compile lint test     # byte-compile without warnings, checkdoc, ERT
   make test EAT_EL=DIR       # also the Eat test, with eat.el in DIR
+  make test-gui GHOSTEL_EL=DIR GHOSTEL_MODULE_DIR=DIR  # parking, in a graphical Emacs
   make bench                 # two batch Emacs through 127.0.0.1
   make bench BENCH_REMOTE=host BENCH_SSH=ssh BENCH_REMOTE_EMACS=emacs
 #+end_src

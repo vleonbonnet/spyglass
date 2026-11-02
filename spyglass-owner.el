@@ -247,6 +247,12 @@ Terminal adapters return the terminal's cursor.")
   (meta-time 0.0 :documentation "When meta was computed.")
   (styles nil :documentation "Hash table of raw property sets and their sanitized form.")
   (jit nil :documentation "Non-nil when registered with jit-lock.")
+  (needs-window 'auto :documentation "t, nil, or auto for the buffer's `spyglass-needs-window'.")
+  (parked nil :documentation "The frame the buffer is parked in, or nil.")
+  (park-size nil :documentation "Cells (COLS . ROWS) of the parking window.")
+  (target nil :documentation "Size its viewers gave the terminal, or nil for its own.")
+  (grid nil :documentation "The terminal's size as last decided, (COLS . ROWS).")
+  (owner-active 0.0 :documentation "When the owner last used or selected the buffer.")
   (counters nil :documentation "Plist of counters and samples."))
 
 (cl-defstruct (spyglass--sub (:constructor spyglass--make-sub) (:copier nil))
@@ -255,7 +261,21 @@ Terminal adapters return the terminal's cursor.")
   (seq 0) (acked 0) (inflight 0) unacked
   intervals ct reset
   styles (next-style 0) faces ov-dirty
-  point window-start meta orphaned)
+  point window-start meta orphaned
+  (size nil :documentation "Cells (COLS . ROWS) of the viewer's window, or nil.")
+  (active 0.0 :documentation "When the viewer last typed or selected its mirror."))
+
+(defvar spyglass--sub-functions nil
+  "Functions called with (SUB EVENT) on a subscription's events.
+EVENT is `opened', `resumed', `orphaned', `freed' or `input'.  For
+spyglass-window.el, which sizes and parks shared buffers.")
+
+(defvar spyglass--poll-functions nil
+  "Functions called with each subscribed share when polling.
+Called in the share's buffer.")
+
+(defvar spyglass--meta-functions nil
+  "Functions called with a share, returning a plist added to its meta.")
 
 (defvar spyglass--shares nil
   "Shares of this Emacs, newest first.")
@@ -949,17 +969,19 @@ off; polling captures again later."
                      (condition-case nil
                          (format-mode-line header-line-format nil nil (current-buffer))
                        (error nil)))))
-    (list :name (spyglass-wire-plain-string (buffer-name))
-          :mode (spyglass-wire-plain-string
-                 (condition-case nil (format-mode-line mode-name) (error "")))
-          :tw tab-width :tl (if truncate-lines t :false)
-          :ww (if word-wrap t :false)
-          :inv (spyglass--invisibility-spec)
-          :hl (if (and header (not (string-empty-p header)))
-                  (spyglass-wire-encode (spyglass-wire-sanitize-string header))
-                :false)
-          :fl (if (spyglass-share-jit share) t :false)
-          :in (if (spyglass-share-read-only share) :false t))))
+    (append
+     (list :name (spyglass-wire-plain-string (buffer-name))
+           :mode (spyglass-wire-plain-string
+                  (condition-case nil (format-mode-line mode-name) (error "")))
+           :tw tab-width :tl (if truncate-lines t :false)
+           :ww (if word-wrap t :false)
+           :inv (spyglass--invisibility-spec)
+           :hl (if (and header (not (string-empty-p header)))
+                   (spyglass-wire-encode (spyglass-wire-sanitize-string header))
+                 :false)
+           :fl (if (spyglass-share-jit share) t :false)
+           :in (if (spyglass-share-read-only share) :false t))
+     (mapcan (lambda (f) (copy-sequence (funcall f share))) spyglass--meta-functions))))
 
 (defun spyglass--refresh-share-state (share)
   "Compute what SHARE's viewers follow: point, window start, description.
@@ -1340,7 +1362,9 @@ just captured."
                        (= (buffer-modified-tick) (spyglass-share-modiff share)))
               (save-restriction
                 (widen)
-                (spyglass--sweep share))))))
+                (spyglass--sweep share)))
+            (dolist (f spyglass--poll-functions)
+              (spyglass--guard nil (funcall f share))))))
       (unless active
         (cancel-timer spyglass--poll-timer)
         (setq spyglass--poll-timer nil)))))
@@ -1360,13 +1384,20 @@ just captured."
       (setf (spyglass-share-subs share) (delq sub (spyglass-share-subs share)))
       (spyglass--share-event share 'unsubscribed (spyglass--sub-key sub))
       (unless (spyglass-share-subs share)
-        (spyglass--deactivate share)))))
+        (spyglass--deactivate share))
+      (spyglass--sub-event sub 'freed))))
 
 (defun spyglass--share-event (share event data)
   "Run `spyglass-share-state-functions' with SHARE, EVENT and DATA."
   (condition-case err
       (run-hook-with-args 'spyglass-share-state-functions share event data)
     (error (message "spyglass: error in share hook: %S" err))))
+
+(defun spyglass--sub-event (sub event)
+  "Run `spyglass--sub-functions' with SUB and EVENT, reporting errors."
+  (dolist (f spyglass--sub-functions)
+    (spyglass--guard (spyglass--sub-connection sub)
+      (funcall f sub event))))
 
 (defun spyglass--new-sub (connection share id key)
   "Return a new subscription of CONNECTION's peer, ID, to SHARE under KEY."
@@ -1393,6 +1424,7 @@ just captured."
     (puthash key sub spyglass--subs)
     (spyglass--share-stat share :snapshots)
     (spyglass--share-event share 'subscribed key)
+    (spyglass--sub-event sub 'opened)
     sub))
 
 (defun spyglass--sub-of (connection header)
@@ -1446,6 +1478,7 @@ just captured."
     (let ((spyglass--sending t))
       (dolist (rec (reverse kept))
         (spyglass--send-frame connection (nth 3 rec))))
+    (spyglass--sub-event sub 'resumed)
     (spyglass--schedule-flush)))
 
 (defun spyglass--owner-close (connection header _payload)
@@ -1511,9 +1544,10 @@ just captured."
                                kind value)
                       nil)
                   (error (error-message-string err)))))))
-      (when problem
-        (spyglass--send connection (list :t "err" :sub (spyglass--sub-id sub)
-                                         :msg problem))))))
+      (if problem
+          (spyglass--send connection (list :t "err" :sub (spyglass--sub-id sub)
+                                           :msg problem))
+        (spyglass--sub-event sub 'input)))))
 
 (defun spyglass--owner-request (connection header _payload)
   "Answer request HEADER from CONNECTION's peer."
@@ -1563,7 +1597,8 @@ just captured."
           (progn (setf (spyglass--sub-connection sub) nil)
                  (spyglass--sub-free sub "disconnected"))
         (setf (spyglass--sub-connection sub) nil
-              (spyglass--sub-orphaned sub) (float-time))))))
+              (spyglass--sub-orphaned sub) (float-time))
+        (spyglass--sub-event sub 'orphaned)))))
 
 (spyglass--register-handler "open" #'spyglass--owner-open)
 (spyglass--register-handler "close" #'spyglass--owner-close)
@@ -1680,15 +1715,20 @@ when the buffer cannot take the input."
 ;;;; Sharing
 
 (cl-defun spyglass-share (&optional buffer &key id (read-only nil read-only-p)
-                                    (input nil input-p) (capture 'auto capture-p))
+                                    (input nil input-p) (capture 'auto capture-p)
+                                    (needs-window 'auto needs-window-p))
   "Share BUFFER, the current buffer by default, and return its share.
 ID is what peers open it by, the buffer's name by default.
 READ-ONLY non-nil refuses viewers' input.  INPUT, a function, applies
 viewers' input instead of `spyglass-input-function' or
 `spyglass-default-input'.  CAPTURE is how changes are found: `auto'
 \(the default), `shadow' or `direct'; see the commentary of
-spyglass-owner.el.  Sharing a shared buffer updates the options given.
-Mirrors cannot be shared."
+spyglass-owner.el.  NEEDS-WINDOW non-nil says the buffer changes only
+while a window shows it, so that spyglass shows it in a hidden window
+while viewers subscribe and no other window shows it; `auto', the
+default, takes the buffer's `spyglass-needs-window', which adapters
+set.  Sharing a shared buffer updates the options given.  Mirrors
+cannot be shared."
   (let ((buffer (window-normalize-buffer buffer)))
     (when (local-variable-p 'spyglass--mirror buffer)
       (error "Buffer %s is a mirror, which spyglass does not share again"
@@ -1698,12 +1738,14 @@ Mirrors cannot be shared."
           (progn
             (when read-only-p (setf (spyglass-share-read-only share) read-only))
             (when input-p (setf (spyglass-share-input share) input))
+            (when needs-window-p (setf (spyglass-share-needs-window share) needs-window))
             (when capture-p (setf (spyglass-share-capture share) capture)))
         (let ((id (spyglass-wire-plain-string (or id (buffer-name buffer)))))
           (when (spyglass--share-by-id id)
             (error "A share named %s exists" id))
           (setq share (spyglass--make-share :id id :buffer buffer :read-only read-only
-                                            :input input :capture capture))
+                                            :input input :capture capture
+                                            :needs-window needs-window))
           (with-current-buffer buffer
             (setq spyglass--share share)
             (add-hook 'after-change-functions #'spyglass--after-change nil t)

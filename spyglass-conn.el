@@ -26,13 +26,15 @@
 ;; 127.0.0.1 (see `spyglass-server-start'), checks the token the other
 ;; end presents.
 ;;
-;; The handshake: each end sends `hello' with the protocol version and
-;; an identifier of its Emacs instance, the connecting end the token
+;; The handshake: each end sends `hello' with the protocol version, an
+;; identifier of its Emacs instance and the optional messages it
+;; handles (`spyglass-wire-capabilities'), the connecting end the token
 ;; too.  Then requests (`req'/`res'), the owner's messages (`open',
-;; `close', `ack', `in', `fl' to it; `u', `closed' from it), heartbeats
-;; (`ping'/`pong', which also estimate the clock offset) and `bye'.
+;; `close', `ack', `in', `fl', `sz' to it; `u', `closed' from it),
+;; heartbeats (`ping'/`pong', which also estimate the clock offset) and
+;; `bye'.  An optional message goes only to peers that announced it.
 ;; Handlers for message types are registered in `spyglass--handlers'
-;; by the owner and mirror modules.
+;; by the owner, mirror and window modules.
 ;;
 ;; Nothing here signals into a filter, sentinel or timer: errors go to
 ;; `spyglass-error-functions' and the connection's own callback.
@@ -97,6 +99,7 @@ SHARES is the list returned by `spyglass-connection-shares'.")
   (state 'connecting :documentation "connecting, open, reconnecting or closed.")
   (peer-id nil :documentation "The peer's `spyglass-instance-id'.")
   (peer-name nil :documentation "The name the peer gave.")
+  (peer-caps nil :documentation "Optional messages the peer handles, as strings.")
   (reader nil :documentation "Buffer of bytes received.")
   (token nil :documentation "Token presented when connecting.")
   (server nil :documentation "Server that accepted the stream, if any.")
@@ -294,7 +297,8 @@ The mirror module acknowledges updates there, once per chunk.")
   (spyglass--send connection
                   (append (list :t "hello" :proto spyglass-wire-protocol
                                 :app "spyglass" :id spyglass-instance-id
-                                :name (or spyglass-instance-name (system-name)))
+                                :name (or spyglass-instance-name (system-name))
+                                :caps (vconcat spyglass-wire-capabilities))
                           (and (spyglass-connection-token connection)
                                (list :token (spyglass-connection-token connection))))))
 
@@ -329,12 +333,16 @@ The mirror module acknowledges updates there, once per chunk.")
                                 problem)))
           (spyglass--drop connection))
       (let ((peer-id (plist-get header :id))
-            (name (plist-get header :name)))
+            (name (plist-get header :name))
+            (caps (plist-get header :caps)))
         (setq connection (spyglass--adopt connection peer-id))
         (setf (spyglass-connection-authenticated connection) t
               (spyglass-connection-peer-id connection) peer-id
               (spyglass-connection-peer-name connection)
               (if (stringp name) name "peer")
+              ;; Peers predating capabilities send none.
+              (spyglass-connection-peer-caps connection)
+              (and (vectorp caps) (cl-remove-if-not #'stringp (append caps nil)))
               (spyglass-connection-attempts connection) 0)
         (when server
           (spyglass--hello connection))
@@ -587,6 +595,11 @@ Return what it wrote to standard error, trimmed, or nil."
   (or (spyglass-connection-name connection)
       (spyglass-connection-peer-name connection)
       "peer"))
+
+(defun spyglass-connection-capable-p (connection capability)
+  "Return non-nil when CONNECTION's peer announced CAPABILITY, a string.
+See `spyglass-wire-capabilities'."
+  (and (member capability (spyglass-connection-peer-caps connection)) t))
 
 (defun spyglass-connections ()
   "Return the live connections, newest first."

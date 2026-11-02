@@ -9,12 +9,13 @@
 | =spyglass-wire.el=    | Frames, payload encoding, the JSON encoding of Lisp values, the sanitizers of faces, display specifications and strings, tokens                      |
 | =spyglass-conn.el=    | Connections: streams, handshake, heartbeats and clock offset, reconnection, requests, the server and its registration file, the TCP and SSH transports |
 | =spyglass-owner.el=   | Shares and subscriptions: capture (hooks, shadow, sentinels, hints, sweep), pending intervals, styles, frames, flow control, resumption, input        |
-| =spyglass-mirror.el=  | Mirrors: =spyglass-mirror-mode=, applying updates, overlays, the owner's cursor, the header line, acknowledgments, sending input                     |
-| =spyglass-eat.el=     | Adapter for Eat: hints around its output and resizes, its cursor, its input functions                                                                |
-| =spyglass-ghostel.el= | Adapter for Ghostel: hints from the region its renderer repainted, its cursor, its key encoder                                                       |
-| =spyglass-vterm.el=   | Adapter for vterm: its key translation (vterm's redraws run modification hooks)                                                                      |
+| =spyglass-mirror.el=  | Mirrors: =spyglass-mirror-mode=, applying updates, overlays, the owner's cursor, the header line, acknowledgments, sending input and window sizes    |
+| =spyglass-window.el=  | The owner's windows: parking frames for buffers needing a window, terminals sized by their viewers' windows, the size policy                         |
+| =spyglass-eat.el=     | Adapter for Eat: hints around its output and resizes, its cursor, its input functions, its size                                                      |
+| =spyglass-ghostel.el= | Adapter for Ghostel: hints from the region its renderer repainted, its cursor, its key encoder, its need of a window, its size                        |
+| =spyglass-vterm.el=   | Adapter for vterm: its key translation (vterm's redraws run modification hooks), its size                                                           |
 
-Tests are in =test/=: =spyglass-wire-test.el= (frames, values, sanitizers), =spyglass-owner-test.el= (interval arithmetic against strings, keys), =spyglass-e2e-test.el= (this Emacs sharing with itself through 127.0.0.1). The benchmarks are =spyglass-bench.el= (the driver), =spyglass-bench-agent.el= (the other Emacs) and =spyglass-bench-common.el= (scenarios, digests, the memory guard).
+Tests are in =test/=: =spyglass-wire-test.el= (frames, values, sanitizers), =spyglass-owner-test.el= (interval arithmetic against strings, keys), =spyglass-e2e-test.el= (this Emacs sharing with itself through 127.0.0.1), =spyglass-window-test.el= (sizes, in batch: ptys, Eat, vterm, Ghostel, the policies), =spyglass-gui-test.el= (parking, in a graphical Emacs, =make test-gui=: frames, Ghostel rendering while parked, mirrored by a second Emacs, redisplay and memory). The benchmarks are =spyglass-bench.el= (the driver), =spyglass-bench-agent.el= (the other Emacs) and =spyglass-bench-common.el= (scenarios, digests, the memory guard).
 
 * Roles and connections
 
@@ -53,7 +54,7 @@ Messages are headers with a type, =t=. After the handshake:
 
 | type      | from      | meaning                                                                                     |
 |-----------+-----------+---------------------------------------------------------------------------------------------|
-| =hello=   | both      | protocol version, application, instance identifier and name; the connecting end's token     |
+| =hello=   | both      | protocol version, application, instance identifier and name, capabilities; the connecting end's token |
 | =error=   | both      | a refusal or protocol error, then the stream closes                                         |
 | =ping=    | both      | heartbeat, stamped with the sender's clock                                                  |
 | =pong=    | both      | answer, stamped with both clocks: round trip and clock offset                               |
@@ -69,8 +70,11 @@ Messages are headers with a type, =t=. After the handshake:
 | =in=      | viewer    | input: text (=k= "s") or a key in =key-description= form (=k= "k")                          |
 | =err=     | owner     | the input was refused or failed                                                             |
 | =fl=      | viewer    | fontify this range, which the viewer displays                                               |
+| =sz=      | viewer    | the size in cells (=c=, =r=; 0 when hidden) of the window showing the mirror; =f= when it just got focus. Capability =sz= |
 
-The handshake: both ends send =hello= at once; the server checks the token with a comparison in constant time, the protocol version (equal major versions) and the application, and answers =error= and closes otherwise. A client refused tries again later with a fresh registration.
+The handshake: both ends send =hello= at once; the server checks the token with a comparison in constant time, the protocol version (equal versions) and the application, and answers =error= and closes otherwise. A client refused tries again later with a fresh registration.
+
+=hello= lists /capabilities/, the optional messages the sender handles (=spyglass-wire-capabilities=). A peer sends such a message only to a peer that announced it: peers of the same protocol version, one older, keep working together, the older one never receiving what it would report as an unknown message; it ignores the capabilities and new keys of =meta= alike. Additions that every peer must understand still change the protocol version.
 
 An update holds:
 
@@ -79,7 +83,7 @@ An update holds:
 - =sd=: new styles, =[ID PLIST]=, property lists the viewer sanitizes once and keeps; =sr= forgets all styles first. =fd=: attributes of the faces the styles name, for viewers lacking them.
 - =ov=: overlays set, =[ID BEG END STYLE]=; =od=: overlays deleted.
 - =pt=, =ws=: the owner's cursor and window start, once the viewer has everything.
-- =meta=: buffer name, mode name, tab width, truncation, word wrap, invisibility spec, the owner's header line, whether fontification requests help, whether input is taken.
+- =meta=: buffer name, mode name, tab width, truncation, word wrap, invisibility spec, the owner's header line, whether fontification requests help, whether input is taken; for terminals viewers size (=rs=), the terminal's size (=gs=).
 - =ct=: when the earliest change it holds happened, on the owner's clock.
 
 * The owner: capture
@@ -118,6 +122,38 @@ Unacknowledged frames are kept. When a stream breaks, the owner's subscriptions 
 A mirror is a buffer in =spyglass-mirror-mode=: read-only, no undo, font lock off (faces come from the owner), no process, none of the owner's modes. Updates apply inside =save-excursion=. The mirror shows the owner's cursor (an overlay in =spyglass-cursor=), and windows on it follow the cursor while their point is where it was; moving away to read stops following. The header line says where the mirror comes from and its state: =opening=, =live=, =reconnecting=, =closed= and why.
 
 Every property value is sanitized on the viewer, whatever the owner did: faces keep names and plain attributes (no function as height), display specifications keep strings, spaces, raising, heights, margins and fringes (no images, no =when=, no forms), invisibility keeps symbols, help echoes keep strings. Unknown face names are replaced by the attributes the owner sent.
+
+* Windows of shared buffers
+
+** Parking
+
+Ghostel renders its terminal only through a window: =ghostel--redraw-now= declines without a /render window/ (any window showing the buffer, graphical ones first), the font and glyph sizes of which it renders with, and output arriving meanwhile stays pending until the buffer is displayed. Even the pty learns of a resize at a render. A shared Ghostel terminal no window shows on the owner would stand still, with its mirrors. Eat and vterm process output and redraw without windows, and need no parking.
+
+A share /needs a window/ when its buffer's =spyglass-needs-window= says so (Ghostel's adapter sets it) or =spyglass-share= was given =:needs-window=. While such a share has subscriptions and no window shows its buffer (the windows of a daemon's initial frame do not count, as Ghostel ignores them), the owner shows it in the root window of a parking frame of its own; polling (=spyglass-poll-interval=) and the subscriptions' events park and unpark. Then the adapter's =spyglass-park-function= renders what was pending. The parking frame is deleted when a window of the user's shows the buffer, the last subscription ends, the buffer is unshared or killed; if something makes it visible, as =display-buffer= does when told to reuse windows of every frame, it is left to the user as an ordinary frame.
+
+A parking frame is made on the display of the selected frame, or of another graphical one, with:
+
+- =visibility= nil, =no-accept-focus=, =no-focus-on-map=, =skip-taskbar=: never shown nor focused. Its focus state stays unknown-false, so Ghostel does not consider the parked terminal looked at (no focus events to the program, no status acknowledged).
+- =no-other-frame=: out of =next-frame= and =other-frame=; =desktop-dont-save=: out of desktops and framesets; =tab-bar-lines= 0 and =tab-bar-lines-keep-state=: =tab-bar-mode= leaves it alone.
+- =minibuffer= nil: the frame uses the default minibuffer frame's, and has =delete-before= that frame, so that deleting the latter, which Emacs refuses while it serves another frame, deletes the parking frame first; the next poll parks again elsewhere.
+- the host frame's =font=; no scroll bars, tool bar or menu bar; =unsplittable=, a dedicated window with =no-other-window=, and an =auto-hide-function= deleting it.
+- =after-make-frame-functions= and =before-make-frame-hook= are not run: they are for frames people see (Cocoa's selects every new frame; configurations raise Emacs). =delete-frame-functions= are not run when spyglass deletes it, lest =undelete-frame= remember it.
+
+A frame per buffer, rather than windows of one frame: a parked terminal takes its viewers' size (below), and the windows of one frame share their widths or their heights, so that sizing one would resize the others, sending their programs =SIGWINCH=, and the frame would grow to hold them all. A parking frame costs 3–25 ms to make (Emacs recomputes every face for a new frame: 200 to 1 700 faces) and 0.3 ms to delete; with the Mac port, its window and glyph matrices hold about 2 MB at 80×24 cells, 8 MB at 200×60 and 55 MB at 500×200 (3, 6 and 12 MB with Cocoa), which bounds what a viewer may ask for (=spyglass-max-terminal-size=). Redisplay skips invisible frames: with ten parked buffers changing, a redisplay took at most 0.06 ms more than with them hidden, against 2 ms more with them shown in windows; checking a parked share at each poll takes 25 µs, its window measured again only when the size called for, the window's pixels, the frame's font or the buffer's face remapping change. See [[file:benchmarks.org][the benchmarks]].
+
+Measured windows are selected for an instant, as =window-max-chars-per-line= and Ghostel's renderer do with =with-selected-window=: the selected frame is restored before anything runs, and no hook sees it change.
+
+Platforms: verified on macOS with the Mac port (31.1) and GNU Emacs's Cocoa build (30.2), by =make test-gui=. On Windows, =x-create-frame= honors =visibility= nil and the other parameters the same way (=w32fns.c=); graphical tests were not run there.
+
+** Sizing terminals
+
+A terminal has one grid; programs lay out their screen for it. Each viewer reports the size, in cells of its own font (=spyglass-window-cells=, as Emacs measures windows for processes: =window-max-chars-per-line= by the floor of =window-screen-lines=), of the window showing its mirror: the selected window if it shows it, else the most recently used on a visible frame; 0 when none does. It reports when the mirror opens or resumes, when windows change (=window-size-change-functions=, =window-buffer-change-functions=, gathered for =spyglass-mirror-size-delay=), and with =f= when a mirror's window gets selected in a focused frame. A viewer typing into its mirror is active too.
+
+On the owner, the parties are the viewers whose windows show the terminal and the owner when a window of its shows it, each with the time it was last active: viewers by =sz= with =f=, input and subscribing; the owner by any command run in a window of the terminal (=post-command-hook=) and by its frame getting focus. =spyglass-size-policy= picks: =latest=, the most recently active party, the owner on ties, as tmux's =window-size latest=; =smallest=, the smallest columns and rows; =owner=, the owner's windows when they show it, else the latest viewer. Without any viewer's size, the terminal sizes itself as before.
+
+Terminals size themselves with =window-adjust-process-window-size-function=: Emacs and Eat and vterm (through their processes' =adjust-window-size-function=) call its value with the process and the windows showing it, Ghostel its default value. While a viewer sizes some terminal, spyglass wraps the default value: for a shared terminal, it answers with the policy's size, computing the owner's part with the wrapped function on the owner's windows, parking windows apart; other processes get the wrapped function's answer. So a terminal resizing itself on a change of the owner's windows keeps the size its parties call for, and the owner's windows themselves are never touched. To apply a new size at once, spyglass calls the share's =spyglass-refit-function=: =spyglass-refit-process= calls the process's adjust function as =window--adjust-process-windows= would, windows or not, then sets the pty's size, and again a second later, since Eat and vterm start their program after an =stty= setting the size the terminal had; Ghostel's adapter calls =ghostel--adjust-size= on a window of the terminal, forced, since Ghostel defers a change of rows alone while the minibuffer is active. A parked terminal's parking frame is sized so that its window has the size called for, and Ghostel resizes its grid, and at its next render its pty, from that window. vterm keeps terminals at least =vterm-min-window-width= wide (80).
+
+The terminal's size travels in =meta= (=gs=) for viewers' header lines. Sizes are bounded by =spyglass-max-terminal-size= on the owner, whatever a viewer sends.
 
 * Input
 

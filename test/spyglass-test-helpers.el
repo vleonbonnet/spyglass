@@ -128,16 +128,18 @@ OWNER non-nil reads BUFFER as an owner's."
   (spyglass-server-start :file spyglass-test--server-file))
 
 (defun spyglass-test-stop ()
-  "Close every connection, share and mirror, and stop the server."
+  "Close every mirror, connection and share, and stop the server."
+  ;; Mirrors first: one reporting its size while connections close
+  ;; would fail to send it.
+  (dolist (buffer (buffer-list))
+    (when (local-variable-p 'spyglass--mirror buffer)
+      (kill-buffer buffer)))
   ;; One end says goodbye; the other hears it and closes too.
   (dolist (c (spyglass-connections))
     (ignore-errors (spyglass-disconnect c))
     (spyglass-test-settle 0.02))
   (dolist (share (spyglass-shares))
     (ignore-errors (spyglass-unshare share)))
-  (dolist (buffer (buffer-list))
-    (when (local-variable-p 'spyglass--mirror buffer)
-      (kill-buffer buffer)))
   (spyglass-server-stop)
   (clrhash spyglass--subs)
   (setq spyglass--connections nil)

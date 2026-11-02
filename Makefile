@@ -34,9 +34,17 @@ BATCH = $(NOPIPE) $(EMACS_BATCH)
 NO_WARNINGS = --eval '(setq byte-compile-error-on-warn t)'
 
 SOURCES = $(filter-out %-pkg.el %-autoloads.el,$(wildcard spyglass*.el))
-TESTS = $(wildcard test/*-test.el)
+# The GUI tests run in a graphical Emacs: see test-gui.
+TESTS = $(filter-out test/spyglass-gui-test.el,$(wildcard test/*-test.el))
 
-.PHONY: all compile test lint bench clean
+# A graphical Emacs for test-gui, started iconified.  macOS restores
+# no saved windows into it; the option goes last, since GNU Emacs's
+# Cocoa build stops processing options at it, as unknown.
+GUI_EMACS ?= $(EMACS)
+GUI_FLAGS ?= $(if $(filter Darwin,$(shell uname)),-ApplePersistenceIgnoreState YES)
+GUI_SELECTOR ?=
+
+.PHONY: all compile test test-gui lint bench clean
 
 all: compile test
 
@@ -51,6 +59,23 @@ test:
 
 lint:
 	$(BATCH) --eval '(dolist (file (list $(patsubst %,"%",$(SOURCES)))) (checkdoc-file file))'
+
+# Parking frames need a graphical display.  The graphical Emacs writes
+# the results to a temporary file, printed here; the benchmark's agent,
+# a batch Emacs, mirrors a Ghostel terminal from it.  The tests start
+# from a timer, once the window system's event loop runs.  Native
+# compilation stays off: it would write to the user's cache.
+test-gui: compile
+	@$(NOPIPE) log=$$(mktemp); \
+	SPYGLASS_GUI_LOG=$$log SPYGLASS_GUI_SELECTOR="$(GUI_SELECTOR)" \
+	SPYGLASS_EMACS="$(EMACS)" SPYGLASS_TIMEOUT="$(TIMEOUT)" \
+	SPYGLASS_GHOSTEL_EL="$(GHOSTEL_EL)" SPYGLASS_GHOSTEL_MODULE_DIR="$(GHOSTEL_MODULE_DIR)" \
+	timeout $(TIMEOUT) $(GUI_EMACS) -Q -iconic --chdir "$(CURDIR)" \
+	  --eval '(setq native-comp-jit-compilation nil load-prefer-newer t)' \
+	  -L . -L test \
+	  --eval '(condition-case err (progn (load "spyglass-gui-test") (run-with-timer 0.5 nil (function spyglass-gui-test-run))) (error (write-region (format "%S\n" err) nil (getenv "SPYGLASS_GUI_LOG")) (kill-emacs 2)))' \
+	  $(GUI_FLAGS); \
+	status=$$?; cat $$log; rm -f $$log; exit $$status
 
 # Not part of test: measures two Emacs processes mirroring through
 # 127.0.0.1, and through SSH to BENCH_REMOTE when set.  See

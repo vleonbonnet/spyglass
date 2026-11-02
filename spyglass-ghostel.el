@@ -24,19 +24,32 @@
 ;; at the top shows as a deletion anyway.  Viewers follow the
 ;; terminal's cursor and type through Ghostel's key encoder.
 ;;
-;; Ghostel renders only buffers shown in a window: a Ghostel terminal
-;; hidden on the owner does not change, so its mirrors do not either.
-;; Loaded with Ghostel by spyglass.el.
+;; Ghostel renders only buffers shown in a window: the adapter marks
+;; its buffers as needing one, so that spyglass parks a shared
+;; terminal no window shows while viewers watch it, and renders there
+;; what arrived while it was hidden.  Ghostel sizes its terminal from
+;; its windows through `window-adjust-process-window-size-function',
+;; which spyglass wraps for viewers' sizes; the adapter makes it fit
+;; again on their changes.  Loaded with Ghostel by spyglass.el.
 
 ;;; Code:
 
 (require 'spyglass-owner)
+(require 'spyglass-window)
 
 (defvar ghostel--repainted-region)
 (defvar ghostel--cursor-char-pos)
+(defvar ghostel--term)
+(defvar ghostel--process)
+(defvar ghostel--term-rows)
+(defvar ghostel--term-cols)
+(defvar ghostel--pending-redraw)
 (declare-function ghostel-send-string "ghostel" (string))
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 (declare-function ghostel--event-key-spec "ghostel" (event &optional meta))
+(declare-function ghostel--windows "ghostel" (&optional buffer all-frames))
+(declare-function ghostel--adjust-size "ghostel" (window &optional force))
+(declare-function ghostel--redraw-now "ghostel" (buffer &optional force))
 
 (defun spyglass-ghostel--after-redraw (&rest _)
   "Tell spyglass what Ghostel's renderer just rewrote in this buffer."
@@ -60,12 +73,40 @@
         (unless spec (user-error "Ghostel cannot encode %s" value))
         (ghostel-send-key (car spec) (cdr spec))))))
 
+(defun spyglass-ghostel--size ()
+  "Return the terminal's size, (COLUMNS . ROWS)."
+  (and (natnump ghostel--term-cols) (natnump ghostel--term-rows)
+       (cons ghostel--term-cols ghostel--term-rows)))
+
+(defun spyglass-ghostel--refit ()
+  "Resize the terminal to what its windows and viewers call for.
+Ghostel resizes on a change of its windows; a viewer's size changes
+none, so its resize is asked for here, on a window Ghostel renders
+through."
+  (when-let* (ghostel--term
+              (windows (ghostel--windows (current-buffer) t))
+              (size (funcall (default-value 'window-adjust-process-window-size-function)
+                             ghostel--process windows)))
+    (unless (equal size (spyglass-ghostel--size))
+      ;; Forced: Ghostel defers a change of rows alone while the
+      ;; minibuffer is active, for the owner's windows.
+      (ghostel--adjust-size (car windows) t))))
+
+(defun spyglass-ghostel--parked ()
+  "Render what arrived while the terminal was hidden."
+  (when ghostel--pending-redraw
+    (ghostel--redraw-now (current-buffer))))
+
 (defun spyglass-ghostel--setup (share)
-  "Set the input and cursor of SHARE when it is a Ghostel terminal."
+  "Set the input, cursor, size and window needs of a Ghostel SHARE."
   (with-current-buffer (spyglass-share-buffer share)
     (when (derived-mode-p 'ghostel-mode)
       (setq-local spyglass-input-function #'spyglass-ghostel--input
-                  spyglass-point-function #'spyglass-ghostel--point))))
+                  spyglass-point-function #'spyglass-ghostel--point
+                  spyglass-needs-window t
+                  spyglass-park-function #'spyglass-ghostel--parked
+                  spyglass-refit-function #'spyglass-ghostel--refit
+                  spyglass-terminal-size-function #'spyglass-ghostel--size))))
 
 (advice-add 'ghostel--redraw :after #'spyglass-ghostel--after-redraw)
 (add-hook 'spyglass-share-functions #'spyglass-ghostel--setup)

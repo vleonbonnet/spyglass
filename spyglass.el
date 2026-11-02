@@ -51,6 +51,7 @@
 (require 'spyglass-wire)
 (require 'spyglass-conn)
 (require 'spyglass-owner)
+(require 'spyglass-window)
 (require 'spyglass-mirror)
 
 (with-eval-after-load 'eat

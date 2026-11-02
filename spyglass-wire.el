@@ -48,6 +48,12 @@
   "Version of the protocol spoken on the wire.
 Peers whose major version differs refuse each other at the handshake.")
 
+(defconst spyglass-wire-capabilities '("sz")
+  "Optional messages this version handles, announced in its hello.
+A peer sends such a message only to peers announcing it, so that
+peers of the same protocol version but older work together: \"sz\",
+the size of the windows showing a mirror.")
+
 (defcustom spyglass-max-frame-size (* 64 1024 1024)
   "Largest frame, header and payload together, accepted from a peer.
 A peer announcing a larger frame is disconnected.  Frames sent stay
@@ -63,6 +69,14 @@ far below it: updates are split into frames of
   "Largest frame accepted before a peer has authenticated.")
 
 (define-error 'spyglass-wire-error "Spyglass protocol error")
+
+(defun spyglass-window-cells (window)
+  "Return the size of WINDOW in cells of its buffer's font, (COLUMNS . ROWS).
+Measured as Emacs measures windows for the size of a process's
+terminal (`window-adjust-process-window-size'): the unit of the sizes
+viewers report (\"sz\") and owners give terminals."
+  (cons (window-max-chars-per-line window)
+        (with-selected-window window (floor (window-screen-lines)))))
 
 ;;;; Statistics
 

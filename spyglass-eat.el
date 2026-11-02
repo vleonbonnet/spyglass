@@ -23,15 +23,21 @@
 ;; start of the terminal's display, as it was or is, to the end; the
 ;; scrollback Eat trims at the top shows as a deletion anyway.  It
 ;; also makes viewers follow the terminal's cursor and type through
-;; Eat's input functions.  Loaded with Eat by spyglass.el.
+;; Eat's input functions.  Eat sizes its terminal through its process's
+;; `adjust-window-size-function', which asks
+;; `window-adjust-process-window-size-function': viewers' sizes reach
+;; it there, and `spyglass-refit-process' applies them to a terminal
+;; no window shows.  Loaded with Eat by spyglass.el.
 
 ;;; Code:
 
 (require 'spyglass-owner)
+(require 'spyglass-window)
 
 (defvar eat-terminal)
 (declare-function eat-term-display-beginning "eat" (terminal))
 (declare-function eat-term-display-cursor "eat" (terminal))
+(declare-function eat-term-size "eat" (terminal))
 (declare-function eat-term-send-string "eat" (terminal string))
 (declare-function eat-term-input-event "eat" (terminal n event &optional ref-pos))
 
@@ -79,12 +85,18 @@
       (seq-doseq (event events)
         (eat-term-input-event eat-terminal 1 event)))))
 
+(defun spyglass-eat--size ()
+  "Return the terminal's size, (COLUMNS . ROWS)."
+  (and eat-terminal (eat-term-size eat-terminal)))
+
 (defun spyglass-eat--setup (share)
-  "Set the input and cursor of SHARE when it is an Eat terminal."
+  "Set the input, cursor and size of SHARE when it is an Eat terminal."
   (with-current-buffer (spyglass-share-buffer share)
     (when (derived-mode-p 'eat-mode)
       (setq-local spyglass-input-function #'spyglass-eat--input
-                  spyglass-point-function #'spyglass-eat--point))))
+                  spyglass-point-function #'spyglass-eat--point
+                  spyglass-refit-function #'spyglass-refit-process
+                  spyglass-terminal-size-function #'spyglass-eat--size))))
 
 (advice-add 'eat--process-output-queue :around #'spyglass-eat--around-write)
 (advice-add 'eat--adjust-process-window-size :around #'spyglass-eat--around-resize)

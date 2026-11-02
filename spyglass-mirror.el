@@ -33,6 +33,10 @@
 ;; A mirror outlives its connection's streams: when a stream breaks it
 ;; shows `reconnecting', and when the connection comes back it resumes
 ;; from the last update it applied, or starts over from a snapshot.
+;;
+;; A mirror of a terminal its owner sizes reports the size of the
+;; window showing it, as it changes, and says when that window gets
+;; focus (see spyglass-window.el).
 
 ;;; Code:
 
@@ -97,6 +101,9 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
   (meta nil :documentation "The owner's description of the buffer.")
   (header nil :documentation "The owner's header line, sanitized.")
   (callback nil :documentation "Function called with (MIRROR EVENT DATA).")
+  (sizable nil :documentation "Non-nil when the owner sizes its terminal to viewers' windows.")
+  (grid nil :documentation "The owner's terminal size, (COLUMNS . ROWS), or nil.")
+  (sent-size nil :documentation "Window size last reported to the owner, or nil.")
   (stats nil :documentation "Plist of counters and samples."))
 
 (defvar-local spyglass--mirror nil
@@ -115,6 +122,8 @@ STATE is one of `opening', `live', `reconnecting' and `closed'.")
   (unless (eq state (spyglass--mirror-state mirror))
     (setf (spyglass--mirror-state mirror) state)
     (when reason (setf (spyglass--mirror-reason mirror) reason))
+    (when (and (eq state 'live) (spyglass--mirror-sizable mirror))
+      (spyglass--mirror-schedule-report))
     (let ((buffer (spyglass--mirror-buffer mirror)))
       (when (buffer-live-p buffer)
         (force-mode-line-update)
@@ -232,6 +241,8 @@ sends it.  Keys typed go to the owner when its share takes input.
                                 ('closed 'spyglass-state-closed)
                                 (_ 'spyglass-state-waiting)))))
       (concat " " (spyglass--mirror-share mirror) "@" label " [" state-text "]"
+              (let ((grid (spyglass--mirror-grid mirror)))
+                (if grid (format " %d×%d" (car grid) (cdr grid)) ""))
               (if (spyglass--mirror-header mirror)
                   (concat "  " (string-replace "%" "%%" (spyglass--mirror-header mirror)))
                 "")))))
@@ -600,6 +611,18 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
         (jit-lock-register #'spyglass--mirror-jit))
     (when (memq #'spyglass--mirror-jit (bound-and-true-p jit-lock-functions))
       (jit-lock-unregister #'spyglass--mirror-jit)))
+  (let ((grid (plist-get meta :gs)))
+    (setf (spyglass--mirror-grid mirror)
+          (and (vectorp grid) (= (length grid) 2)
+               (natnump (aref grid 0)) (natnump (aref grid 1))
+               (cons (aref grid 0) (aref grid 1)))))
+  (let ((sizable (eq (plist-get meta :rs) t)))
+    (unless (eq sizable (spyglass--mirror-sizable mirror))
+      (setf (spyglass--mirror-sizable mirror) sizable
+            (spyglass--mirror-sent-size mirror) nil)
+      (when sizable
+        (spyglass--mirror-watch-windows)
+        (spyglass--mirror-schedule-report))))
   (force-mode-line-update))
 
 (defun spyglass--mirror-apply-point (mirror pt)
@@ -680,6 +703,8 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
   "Reopen CONNECTION's mirrors on its new stream."
   (maphash (lambda (_ mirror)
              (unless (eq (spyglass--mirror-state mirror) 'closed)
+               ;; The owner may have lost the size, or be another one.
+               (setf (spyglass--mirror-sent-size mirror) nil)
                (spyglass--mirror-send-open mirror)))
            (spyglass-connection-mirrors connection)))
 
@@ -702,6 +727,101 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
 (add-hook 'spyglass--after-input-functions #'spyglass--mirror-acknowledge)
 (add-hook 'spyglass--attach-functions #'spyglass--mirror-attach)
 (add-hook 'spyglass--detach-functions #'spyglass--mirror-detach)
+
+;;;; Sizes
+
+(defcustom spyglass-mirror-size-delay 0.1
+  "Seconds changes of windows gather before mirrors report their sizes."
+  :group 'spyglass
+  :type 'number)
+
+(defvar spyglass--mirror-size-timer nil
+  "Timer reporting the sizes of mirrors' windows, or nil.")
+
+(defvar spyglass--mirror-focus nil
+  "Buffer of the mirror that got focus and was not reported yet, or nil.")
+
+(defvar spyglass--mirror-focused nil
+  "Buffer of the mirror last reported as focused, or nil.")
+
+(defvar spyglass--mirror-watching nil
+  "Non-nil while the window hooks of sizable mirrors are installed.")
+
+(defun spyglass--mirror-window (buffer)
+  "Return the window whose size BUFFER, a mirror, reports, or nil.
+The selected window when it shows BUFFER, else the most recently used
+window showing it on a visible frame."
+  (let ((windows (cl-remove-if-not (lambda (w) (eq (frame-visible-p (window-frame w)) t))
+                                   (get-buffer-window-list buffer nil t))))
+    (if (memq (selected-window) windows)
+        (selected-window)
+      (car (cl-sort windows #'> :key (lambda (w) (or (window-use-time w) 0)))))))
+
+(defun spyglass--mirror-report-sizes ()
+  "Report to owners the windows of sizable mirrors that changed or got focus."
+  (setq spyglass--mirror-size-timer nil)
+  (spyglass--guard nil
+    (let ((focus (prog1 spyglass--mirror-focus (setq spyglass--mirror-focus nil)))
+          (any nil))
+      (dolist (connection (spyglass-connections))
+        (maphash
+         (lambda (_ mirror)
+           (let ((buffer (spyglass--mirror-buffer mirror)))
+             (when (and (spyglass--mirror-sizable mirror) (buffer-live-p buffer))
+               (setq any t)
+               (when (and (eq (spyglass--mirror-state mirror) 'live)
+                          (spyglass-connection-live-p connection)
+                          (spyglass-connection-capable-p connection "sz"))
+                 (let* ((window (spyglass--mirror-window buffer))
+                        (size (if window (spyglass-window-cells window) (cons 0 0)))
+                        (focused (and window (eq buffer focus))))
+                   (when (or focused
+                             (not (equal size (spyglass--mirror-sent-size mirror))))
+                     (setf (spyglass--mirror-sent-size mirror) size)
+                     (spyglass--mirror-stat mirror :size-reports)
+                     (spyglass--send connection
+                                     (list :t "sz" :sub (spyglass--mirror-id mirror)
+                                           :c (car size) :r (cdr size)
+                                           :f (if focused t :false)))))))))
+         (spyglass-connection-mirrors connection)))
+      (unless any (spyglass--mirror-unwatch-windows)))))
+
+(defun spyglass--mirror-schedule-report (&rest _)
+  "Report mirrors' window sizes after `spyglass-mirror-size-delay'."
+  (unless spyglass--mirror-size-timer
+    (setq spyglass--mirror-size-timer
+          (run-with-timer spyglass-mirror-size-delay nil #'spyglass--mirror-report-sizes))))
+
+(defun spyglass--mirror-check-focus (&rest _)
+  "Report a sizable mirror whose window just got the focus."
+  (let* ((window (selected-window))
+         (buffer (window-buffer window))
+         (mirror (buffer-local-value 'spyglass--mirror buffer)))
+    (if (and mirror (spyglass--mirror-sizable mirror)
+             (frame-focus-state (window-frame window)))
+        (unless (eq buffer spyglass--mirror-focused)
+          (setq spyglass--mirror-focused buffer
+                spyglass--mirror-focus buffer)
+          (spyglass--mirror-schedule-report))
+      (setq spyglass--mirror-focused nil))))
+
+(defun spyglass--mirror-watch-windows ()
+  "Report sizes and focus of mirrors' windows as they change."
+  (unless spyglass--mirror-watching
+    (setq spyglass--mirror-watching t)
+    (add-hook 'window-size-change-functions #'spyglass--mirror-schedule-report)
+    (add-hook 'window-buffer-change-functions #'spyglass--mirror-schedule-report)
+    (add-hook 'window-selection-change-functions #'spyglass--mirror-check-focus)
+    (add-function :after after-focus-change-function #'spyglass--mirror-check-focus)))
+
+(defun spyglass--mirror-unwatch-windows ()
+  "Stop watching windows: no sizable mirror is left."
+  (when spyglass--mirror-watching
+    (setq spyglass--mirror-watching nil)
+    (remove-hook 'window-size-change-functions #'spyglass--mirror-schedule-report)
+    (remove-hook 'window-buffer-change-functions #'spyglass--mirror-schedule-report)
+    (remove-hook 'window-selection-change-functions #'spyglass--mirror-check-focus)
+    (remove-function after-focus-change-function #'spyglass--mirror-check-focus)))
 
 ;;;; Input
 
