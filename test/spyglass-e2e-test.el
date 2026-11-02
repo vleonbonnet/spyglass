@@ -72,6 +72,27 @@
         (spyglass-test-converge (current-buffer) mirror)
         (should (equal (with-current-buffer mirror (buffer-string)) (buffer-string)))))))
 
+(ert-deftest spyglass-e2e-random-bytes ()
+  "Random bytes from a process, raw bytes among them, arrive exactly."
+  (skip-unless (and (file-readable-p "/dev/urandom") (executable-find "head")))
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "urandom"
+      (let* ((buffer (current-buffer))
+             (mirror (spyglass-test-mirror connection buffer))
+             (process (make-process
+                       :name "urandom" :command '("head" "-c" "300000" "/dev/urandom")
+                       :coding 'utf-8 :connection-type 'pipe
+                       :filter (lambda (_p s)
+                                 (with-current-buffer buffer
+                                   (goto-char (point-max))
+                                   (insert s))))))
+        (spyglass-test-wait (lambda () (not (process-live-p process))) 20)
+        (accept-process-output nil 0.1)
+        (should (> (buffer-size) 100000))
+        (should (string-match-p "[\200-\377]" (buffer-string)))
+        (spyglass-test-converge buffer mirror 20)
+        (should (equal (with-current-buffer mirror (buffer-string)) (buffer-string)))))))
+
 (ert-deftest spyglass-e2e-unibyte-owner ()
   "A unibyte buffer mirrors byte for byte, as raw bytes."
   (spyglass-test-with-connection connection
