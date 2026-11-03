@@ -319,6 +319,28 @@ resumption under way, and the mirror would resume fewer times."
               (should-not (spyglass-reconnect client))))
         (kill-buffer buffer)))))
 
+(ert-deftest spyglass-conn-test-stream-ending ()
+  "Each end tells how its last stream ended: dropped here, closed there, or a process's exit."
+  (spyglass-conn-test--with (client server)
+    (should-not (spyglass-connection-ending client))
+    (let ((spyglass-reconnect-delays '(5)))
+      (spyglass-connection-drop-stream client))
+    (should (equal (spyglass-connection-ending client) "dropped by this end"))
+    (spyglass-test-wait (lambda () (spyglass-connection-ending server)))
+    (should (equal (spyglass-connection-ending server) "closed")))
+  (let* ((spyglass-test-errors nil)
+         (spyglass-reconnect-delays '(30))
+         (connection (spyglass-connect
+                      (lambda (callback)
+                        (funcall callback (make-process :name "spyglass-exit" :noquery t
+                                                        :connection-type 'pipe
+                                                        :command '("sh" "-c" "exit 3")))))))
+    (unwind-protect
+        (progn
+          (spyglass-test-wait (lambda () (spyglass-connection-ending connection)))
+          (should (equal (spyglass-connection-ending connection) "exited with status 3")))
+      (spyglass-disconnect connection))))
+
 (defun spyglass-conn-test--fill (buffer lines tag)
   "Add LINES lines tagged TAG to BUFFER, with faces now and then.
 Lines go at the end and, every few, at places spread through the

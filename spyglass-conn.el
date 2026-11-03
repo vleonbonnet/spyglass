@@ -933,10 +933,31 @@ dropped within that after TIMEOUT."
       (spyglass--guard connection
         (spyglass--lost connection)))))
 
+(defvar spyglass--endings (make-hash-table :test #'eq :weakness 'key)
+  "How the last stream of each connection ended, a line, by connection.")
+
+(defun spyglass-connection-ending (connection)
+  "Return how the last stream of CONNECTION ended, a line, or nil.
+Such as \"exited with status 255\" for an SSH process, \"closed\" for a
+socket the peer closed, or \"dropped by this end\" for a stream this
+Emacs ended, its write having failed or its peer fallen silent; nil
+while no stream of it ended."
+  (gethash connection spyglass--endings))
+
+(defun spyglass--process-ending (process)
+  "Return how PROCESS, a stream that ended, ended, a line."
+  (cond ((process-get process 'spyglass-dropped) "dropped by this end")
+        (t (pcase (process-status process)
+             ('exit (format "exited with status %d" (process-exit-status process)))
+             ('signal (format "killed by signal %d" (process-exit-status process)))
+             ('failed "failed")
+             (_ "closed")))))
+
 (defun spyglass--drop (connection)
   "End CONNECTION's current stream; it comes back if it has a transport."
   (let ((process (spyglass-connection-process connection)))
     (when (process-live-p process)
+      (process-put process 'spyglass-dropped t)
       (process-put process 'spyglass-connection nil)
       (delete-process process))
     (when (eq process (spyglass-connection-process connection))
@@ -964,6 +985,7 @@ Return what it wrote to standard error, trimmed, or nil."
   "Handle the end of CONNECTION's stream."
   (let ((process (spyglass-connection-process connection)))
     (when process
+      (puthash connection (spyglass--process-ending process) spyglass--endings)
       (let ((stderr (spyglass--discard-process process)))
         (when stderr
           (spyglass--report connection "%s: %s"
