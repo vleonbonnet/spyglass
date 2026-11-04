@@ -143,7 +143,7 @@ while kill -0 "$launcher" 2> /dev/null; do
     stop
     break
   fi
-  sleep 0.5
+  sleep 0.1
 done
 wait "$launcher"
 exited=$?
