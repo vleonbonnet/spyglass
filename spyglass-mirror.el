@@ -114,6 +114,9 @@ connection holds all its mirrors, which each printed again from every
 mirror."
   (spyglass--deref (spyglass--mirror-connection-ref mirror)))
 
+(defvar spyglass--mirror-titles (make-hash-table :test #'eq :weakness 'key)
+  "Titles mirrors were opened with, by mirror.")
+
 (defvar-local spyglass--mirror nil
   "The mirror shown in this buffer.")
 (put 'spyglass--mirror 'permanent-local t)
@@ -240,7 +243,8 @@ sends it.  Keys typed go to the owner when its share takes input.
                                 ('live 'spyglass-state-live)
                                 ('closed 'spyglass-state-closed)
                                 (_ 'spyglass-state-waiting)))))
-      (concat " " (spyglass--mirror-share mirror) "@" label " [" state-text "]"
+      (concat " " (or (gethash mirror spyglass--mirror-titles) (spyglass--mirror-share mirror))
+              "@" label " [" state-text "]"
               (let ((grid (spyglass--mirror-grid mirror)))
                 (if grid (format " %d×%d" (car grid) (cdr grid)) ""))
               (if (spyglass--mirror-header mirror)
@@ -254,20 +258,30 @@ sends it.  Keys typed go to the owner when its share takes input.
   (format "*%s@%s*" (string-trim share-id "\\*+" "\\*+")
           (spyglass-connection-label connection)))
 
-(cl-defun spyglass-open (connection share-id &key buffer-name callback)
+(cl-defun spyglass-open (connection share-id &key buffer-name callback buffer title)
   "Open a mirror of SHARE-ID, a share of CONNECTION's peer; return its buffer.
 The buffer, named BUFFER-NAME or after the share and the peer, fills
 asynchronously.  CALLBACK, if non-nil, is called with (MIRROR EVENT
 DATA): `state' with the mirror's new state, `error' with a message
-from the owner.  Opening a share already mirrored on CONNECTION
+from the owner.  BUFFER, a buffer whose mirror closed, is opened in
+instead of a new buffer, emptied first: windows showing it show the new
+mirror, as for an application opening anew a mirror that a connection
+lost for good closed.  TITLE names the mirror in its header line
+instead of SHARE-ID.  Opening a share already mirrored on CONNECTION
 returns that mirror's buffer."
   (or (cl-loop for m being the hash-values of (spyglass-connection-mirrors connection)
                when (and (equal (spyglass--mirror-share m) share-id)
                          (not (eq (spyglass--mirror-state m) 'closed))
                          (buffer-live-p (spyglass--mirror-buffer m)))
                return (spyglass--mirror-buffer m))
-      (let* ((buffer (generate-new-buffer
-                      (or buffer-name (spyglass--mirror-name share-id connection))))
+      (let* ((old (and buffer (buffer-live-p buffer)
+                       (buffer-local-value 'spyglass--mirror buffer)))
+             (buffer (cond ((null buffer)
+                            (generate-new-buffer
+                             (or buffer-name (spyglass--mirror-name share-id connection))))
+                           ((not (and old (eq (spyglass--mirror-state old) 'closed)))
+                            (error "Buffer %s shows no mirror that closed" buffer))
+                           (t buffer)))
              (mirror (spyglass--make-mirror
                       :connection-ref (spyglass--ref connection)
                       :id (cl-incf (spyglass-connection-next-sub connection))
@@ -276,12 +290,29 @@ returns that mirror's buffer."
                       :faces (make-hash-table :test #'equal)
                       :overlays (make-hash-table :test #'eql))))
         (with-current-buffer buffer
-          (spyglass-mirror-mode)
+          (if old
+              (spyglass--mirror-clear old)
+            (spyglass-mirror-mode))
           (setq spyglass--mirror mirror))
+        (when title
+          (puthash mirror (spyglass-wire-plain-string title) spyglass--mirror-titles))
         (puthash (spyglass--mirror-id mirror) mirror (spyglass-connection-mirrors connection))
         (when (spyglass-connection-live-p connection)
           (spyglass--mirror-send-open mirror))
         buffer)))
+
+(defun spyglass--mirror-clear (mirror)
+  "Empty the buffer of MIRROR, closed, for another mirror to fill it."
+  (with-current-buffer (spyglass--mirror-buffer mirror)
+    (let ((inhibit-read-only t))
+      (widen)
+      (erase-buffer))
+    (maphash (lambda (_ ov) (delete-overlay ov)) (spyglass--mirror-overlays mirror))
+    (clrhash (spyglass--mirror-overlays mirror))
+    (when (spyglass--mirror-cursor mirror)
+      (delete-overlay (spyglass--mirror-cursor mirror)))
+    (when (memq #'spyglass--mirror-jit (bound-and-true-p jit-lock-functions))
+      (jit-lock-unregister #'spyglass--mirror-jit))))
 
 (defun spyglass--mirror-send-open (mirror &optional fresh)
   "Ask MIRROR's owner for its updates, resuming unless FRESH."
@@ -828,12 +859,13 @@ window showing it on a visible frame."
 (defun spyglass--mirror-input (mirror kind value)
   "Send MIRROR's owner input of KIND, `string' or `key', and VALUE."
   (let ((connection (spyglass--mirror-connection mirror))
-        (meta (spyglass--mirror-meta mirror)))
+        (meta (spyglass--mirror-meta mirror))
+        (name (or (gethash mirror spyglass--mirror-titles) (spyglass--mirror-share mirror))))
     (cond
      ((not (spyglass-connection-live-p connection))
-      (user-error "Mirror %s is not connected" (spyglass--mirror-share mirror)))
+      (user-error "Mirror %s is not connected" name))
      ((eq (plist-get meta :in) :false)
-      (user-error "Share %s is read-only" (spyglass--mirror-share mirror)))
+      (user-error "Mirror %s is read-only: its owner takes no input from here" name))
      (t (spyglass--send connection (list :t "in" :sub (spyglass--mirror-id mirror)
                                          :k (if (eq kind 'key) "k" "s") :v value))))))
 

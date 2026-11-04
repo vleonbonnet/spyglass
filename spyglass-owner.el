@@ -276,6 +276,40 @@ Called in the share's buffer.")
 (defvar spyglass--shares nil
   "Shares of this Emacs, newest first.")
 
+(defvar spyglass--share-options (make-hash-table :test #'eq :weakness 'key)
+  "Options of shares beyond their slots, a plist, by share.
+`:peers', a predicate of the connections a share is visible to, and
+`:size-policy', the share's own `spyglass-size-policy'.  Kept apart from
+the share's slots, so that shares made by an older spyglass loaded
+before keep working.")
+
+(defun spyglass--share-option (share option)
+  "Return SHARE's OPTION, a keyword of `spyglass--share-options', or nil."
+  (plist-get (gethash share spyglass--share-options) option))
+
+(defun spyglass--share-visible-p (share connection)
+  "Return non-nil when CONNECTION's peer may see and open SHARE.
+A predicate SHARE was given with `:peers' decides; an error in it hides
+SHARE."
+  (let ((peers (spyglass--share-option share :peers)))
+    (or (null peers)
+        (condition-case err
+            (funcall peers connection)
+          (error (spyglass--report connection "Share %s: its :peers failed: %s"
+                                   (spyglass-share-id share) (error-message-string err))
+                 nil)))))
+
+(defun spyglass--share-refuses-input-p (share connection)
+  "Return non-nil when SHARE takes no input from CONNECTION's peer.
+SHARE's `read-only' is non-nil, or a function of the connection
+returning non-nil; an error in it refuses."
+  (let ((read-only (spyglass-share-read-only share)))
+    (if (functionp read-only)
+        (condition-case nil
+            (funcall read-only connection)
+          (error t))
+      read-only)))
+
 (defvar spyglass--subs (make-hash-table :test #'equal)
   "Hash table of subscription keys, PEER-ID/SUB-ID, and subscriptions.")
 
@@ -976,7 +1010,10 @@ off; polling captures again later."
                    (spyglass-wire-encode (spyglass-wire-sanitize-string header))
                  :false)
            :fl (if (spyglass-share-jit share) t :false)
-           :in (if (spyglass-share-read-only share) :false t))
+           ;; A function decides per viewer: see `spyglass--meta-for'.
+           :in (if (and (spyglass-share-read-only share)
+                        (not (functionp (spyglass-share-read-only share))))
+                   :false t))
      (mapcan (lambda (f) (copy-sequence (funcall f share))) spyglass--meta-functions))))
 
 (defun spyglass--refresh-share-state (share)
@@ -1100,6 +1137,18 @@ no mirrored property.  ACC collects new definitions, see
   (let ((connection (spyglass--sub-connection sub)))
     (and connection (spyglass-connection-live-p connection))))
 
+(defun spyglass--meta-for (sub meta)
+  "Return META, its share's description, as SUB's viewer gets it.
+A share whose `read-only' is a function takes input from some viewers
+only: each is told whether it may type."
+  (let ((read-only (spyglass-share-read-only (spyglass--sub-share sub))))
+    (if (and meta (functionp read-only) (spyglass--sub-connection sub))
+        (plist-put (copy-sequence meta) :in
+                   (if (spyglass--share-refuses-input-p (spyglass--sub-share sub)
+                                                        (spyglass--sub-connection sub))
+                       :false t))
+      meta)))
+
 (defun spyglass--build-frame (sub)
   "Return the next frame for SUB as (HEADER . PAYLOAD), or nil if none is due."
   (let* ((share (spyglass--sub-share sub))
@@ -1139,7 +1188,7 @@ no mirrored property.  ACC collects new definitions, see
            (ovs nil) (dels nil)
            (pt (and synced (spyglass-share-point share)))
            (ws (and synced (spyglass-share-window-start share)))
-           (meta (spyglass-share-meta share))
+           (meta (spyglass--meta-for sub (spyglass-share-meta share)))
            (send-pt (and pt (not (eql pt (spyglass--sub-point sub)))))
            (send-ws (and ws (not (eql ws (spyglass--sub-window-start sub)))))
            (send-meta (and meta (not (equal meta (spyglass--sub-meta sub))))))
@@ -1450,7 +1499,8 @@ just captured."
     (cond
      ((not (natnump id))
       (spyglass--report connection "Open without a subscription identifier"))
-     ((or (not share) (not (buffer-live-p (spyglass-share-buffer share))))
+     ((or (not share) (not (buffer-live-p (spyglass-share-buffer share)))
+          (not (spyglass--share-visible-p share connection)))
       (spyglass--send connection (list :t "closed" :sub id :reason "no such share")))
      ((and existing resume (eq (spyglass--sub-share existing) share)
            (equal (plist-get resume :epoch) (spyglass--sub-epoch existing))
@@ -1535,7 +1585,7 @@ just captured."
            (value (plist-get header :v))
            (problem
             (cond
-             ((spyglass-share-read-only share) "this share is read-only")
+             ((spyglass--share-refuses-input-p share connection) "this share is read-only")
              ((not (and kind (stringp value))) "malformed input")
              ((and (eq kind 'key) (not (key-valid-p value))) "invalid key")
              (t (condition-case err
@@ -1556,12 +1606,12 @@ just captured."
   (let ((rid (plist-get header :rid)))
     (pcase (plist-get header :op)
       ("list" (spyglass--send connection (list :t "res" :rid rid
-                                               :shares (spyglass--share-list))))
+                                               :shares (spyglass--share-list connection))))
       (_ (spyglass--send connection (list :t "res" :rid rid
                                           :error "unknown request"))))))
 
-(defun spyglass--share-list ()
-  "Return the shares described for peers, as a vector."
+(defun spyglass--share-list (connection)
+  "Return the shares CONNECTION's peer may see, described, as a vector."
   (vconcat
    (mapcar (lambda (share)
              (let ((buffer (spyglass-share-buffer share)))
@@ -1572,20 +1622,20 @@ just captured."
                               (condition-case nil (format-mode-line mode-name)
                                 (error ""))))
                      :size (buffer-size buffer)
-                     :input (if (spyglass-share-read-only share) :false t))))
-           (reverse (cl-remove-if-not (lambda (s) (buffer-live-p (spyglass-share-buffer s)))
+                     :input (if (spyglass--share-refuses-input-p share connection) :false t))))
+           (reverse (cl-remove-if-not (lambda (s) (and (buffer-live-p (spyglass-share-buffer s))
+                                                       (spyglass--share-visible-p s connection)))
                                       spyglass--shares)))))
 
 (defun spyglass--announce-shares ()
-  "Tell every connected peer the list of shares."
-  (let ((list (spyglass--share-list)))
-    (dolist (connection (spyglass-connections))
-      (when (spyglass-connection-live-p connection)
-        (spyglass--send connection (list :t "shares" :list list))))))
+  "Tell every connected peer the list of the shares it may see."
+  (dolist (connection (spyglass-connections))
+    (when (spyglass-connection-live-p connection)
+      (spyglass--send connection (list :t "shares" :list (spyglass--share-list connection))))))
 
 (defun spyglass--owner-attach (connection)
-  "Tell CONNECTION's new peer our shares."
-  (spyglass--send connection (list :t "shares" :list (spyglass--share-list))))
+  "Tell CONNECTION's new peer the shares it may see."
+  (spyglass--send connection (list :t "shares" :list (spyglass--share-list connection))))
 
 (defun spyglass--owner-detach (connection final)
   "Orphan the subscriptions of CONNECTION's peer, or end them if FINAL."
@@ -1718,23 +1768,33 @@ when the buffer cannot take the input."
 
 (cl-defun spyglass-share (&optional buffer &key id (read-only nil read-only-p)
                                     (input nil input-p) (capture 'auto capture-p)
-                                    (needs-window 'auto needs-window-p))
+                                    (needs-window 'auto needs-window-p)
+                                    (peers nil peers-p) (size-policy nil size-policy-p))
   "Share BUFFER, the current buffer by default, and return its share.
 ID is what peers open it by, the buffer's name by default.
-READ-ONLY non-nil refuses viewers' input.  INPUT, a function, applies
-viewers' input instead of `spyglass-input-function' or
-`spyglass-default-input'.  CAPTURE is how changes are found: `auto'
+READ-ONLY non-nil refuses viewers' input; a function, called with a
+viewer's connection, refuses that viewer's input when it returns
+non-nil, each viewer being told whether it may type.  INPUT, a
+function, applies viewers' input instead of `spyglass-input-function'
+or `spyglass-default-input'.  CAPTURE is how changes are found: `auto'
 \(the default), `shadow' or `direct'; see the commentary of
 spyglass-owner.el.  NEEDS-WINDOW non-nil says the buffer changes only
 while a window shows it, so that spyglass shows it in a hidden window
 while viewers subscribe and no other window shows it; `auto', the
 default, takes the buffer's `spyglass-needs-window', which adapters
-set.  Sharing a shared buffer updates the options given.  Mirrors
-cannot be shared."
+set.  PEERS, a predicate of a connection, makes the share visible to
+the peers it accepts alone: others are not told of it, and cannot open
+it; nil, the default, shares with every peer.  SIZE-POLICY is the
+share's own `spyglass-size-policy', for a terminal its viewers size;
+nil follows that option.  Sharing a shared buffer updates the options
+given: viewers PEERS no longer accepts see their mirrors closed.
+Mirrors cannot be shared."
   (let ((buffer (window-normalize-buffer buffer)))
     (when (local-variable-p 'spyglass--mirror buffer)
       (error "Buffer %s is a mirror, which spyglass does not share again"
              (buffer-name buffer)))
+    (when (and size-policy (not (memq size-policy '(latest smallest owner))))
+      (error "Unknown size policy: %s" size-policy))
     (let ((share (buffer-local-value 'spyglass--share buffer)))
       (if share
           (progn
@@ -1755,6 +1815,17 @@ cannot be shared."
             (add-hook 'kill-buffer-hook #'spyglass--kill-buffer nil t))
           (push share spyglass--shares)
           (run-hook-with-args 'spyglass-share-functions share)))
+      (when (or peers-p size-policy-p)
+        (let ((options (gethash share spyglass--share-options)))
+          (when peers-p (setq options (plist-put options :peers peers)))
+          (when size-policy-p (setq options (plist-put options :size-policy size-policy)))
+          (puthash share options spyglass--share-options)))
+      ;; Viewers no longer allowed lose their mirrors.
+      (when peers-p
+        (dolist (sub (copy-sequence (spyglass-share-subs share)))
+          (let ((connection (spyglass--sub-connection sub)))
+            (when (and connection (not (spyglass--share-visible-p share connection)))
+              (spyglass--sub-free sub "unshared")))))
       (setf (spyglass-share-meta-time share) 0.0)
       (spyglass--announce-shares)
       share)))

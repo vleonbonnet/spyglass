@@ -113,10 +113,11 @@ all the others, and the list of timers to the square of the requests."
                   (insert (format "share %d\n" i))
                   (put-text-property 1 6 'face 'bold)
                   (overlay-put (make-overlay 1 3) 'face 'italic))
-                (spyglass-share buffer)))
+                ;; Options kept beside shares print with them.
+                (spyglass-share buffer :peers (lambda (_connection) t) :size-policy 'owner)))
             (let ((pairs nil))
               (dolist (buffer buffers)
-                (push (cons buffer (spyglass-open client (buffer-name buffer))) pairs)
+                (push (cons buffer (spyglass-open client (buffer-name buffer) :title "Title")) pairs)
                 (push (cons buffer (spyglass-open second (buffer-name buffer))) pairs))
               (spyglass-test-wait (lambda () (cl-every (lambda (p) (eq (spyglass-mirror-state (cdr p)) 'live))
                                                        pairs))

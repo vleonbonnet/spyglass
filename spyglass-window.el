@@ -67,7 +67,7 @@ and the viewers whose windows show their mirrors.  `latest': the
 party that last typed into the terminal or selected it, the owner
 winning ties; `smallest': the smallest width and the smallest height
 among all; `owner': the owner's windows while one shows the terminal,
-else as `latest'."
+else as `latest'.  A share may have its own (see `spyglass-share')."
   :group 'spyglass
   :type '(choice (const :tag "Most recently active" latest)
                  (const :tag "Smallest" smallest)
@@ -345,7 +345,7 @@ or nil when none shows it.  Nil unless a viewer's window shows it."
     (when viewers
       (let ((owner (and owner-size
                         (cons owner-size (spyglass-share-owner-active share)))))
-        (pcase spyglass-size-policy
+        (pcase (or (spyglass--share-option share :size-policy) spyglass-size-policy)
           ('smallest
            (let ((all (mapcar #'car (if owner (cons owner viewers) viewers))))
              (cons (apply #'min (mapcar #'car all)) (apply #'min (mapcar #'cdr all)))))

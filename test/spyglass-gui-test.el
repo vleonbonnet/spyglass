@@ -227,6 +227,53 @@ visible frames only."
         (delete-other-windows)
         (let ((kill-buffer-query-functions nil)) (kill-buffer buffer))))))
 
+(ert-deftest spyglass-gui-owner-policy-of-a-share ()
+  "A share's own `owner' policy: the viewer's window sizes it while parked, the owner's once shown there."
+  (spyglass-test-with-connection connection
+    (let ((buffer (generate-new-buffer "owner-pty"))
+          (config (current-window-configuration))
+          ;; Whatever the option says, the share's policy decides.
+          (spyglass-size-policy 'latest))
+      (unwind-protect
+          (spyglass-gui-test--with-visible-frame
+            (with-current-buffer buffer
+              (make-process :name "owner-pty" :buffer buffer :command '("cat")
+                            :connection-type 'pty :noquery t)
+              (setq-local spyglass-refit-function #'spyglass-refit-process))
+            (spyglass-share buffer :needs-window t :size-policy 'owner)
+            (let* ((mirror (spyglass-test-mirror connection buffer))
+                   (viewer-window (split-window nil 12 t))
+                   (process (get-buffer-process buffer)))
+              (set-window-buffer viewer-window mirror)
+              (redisplay t)
+              (spyglass-test-wait (lambda () (spyglass-gui-test--parked-p buffer)))
+              ;; Parked: the viewer's window.
+              (let ((want (spyglass-window-cells viewer-window)))
+                (spyglass-test-wait (lambda () (equal (spyglass-gui-test--tty-size process) want)))
+                (should (equal (spyglass-gui-test--tty-size process) want)))
+              ;; Shown in a window of the owner's: that window, though
+              ;; the viewer typed last.
+              (spyglass-mirror-send-string "x" mirror)
+              (let ((owner-window (split-window (frame-root-window) nil 'below)))
+                (set-window-buffer owner-window buffer)
+                (redisplay t)
+                (spyglass-test-wait (lambda () (null (spyglass-gui-test--parked-p buffer))))
+                (with-current-buffer buffer (spyglass--refit (spyglass-share-of buffer)))
+                (let ((want (spyglass-window-cells owner-window)))
+                  (spyglass-test-wait (lambda () (equal (spyglass-gui-test--tty-size process) want)))
+                  (should (equal (spyglass-gui-test--tty-size process) want)))
+                ;; Hidden there again: the viewer's window once more.
+                (delete-window owner-window)
+                (redisplay t)
+                (spyglass-test-wait (lambda () (spyglass-gui-test--parked-p buffer)))
+                (let ((want (spyglass-window-cells viewer-window)))
+                  (spyglass-test-wait (lambda () (equal (spyglass-gui-test--tty-size process) want)))
+                  (should (equal (spyglass-gui-test--tty-size process) want))))
+              (kill-buffer mirror)))
+        (set-window-configuration config)
+        (delete-other-windows)
+        (let ((kill-buffer-query-functions nil)) (kill-buffer buffer))))))
+
 (defconst spyglass-gui-test--script
   (concat "sleep 1; i=0; while [ $i -lt 40 ]; do echo \"parked line $i\"; i=$((i+1)); "
           "sleep 0.05; done; echo done; while :; do stty size; sleep 0.2; done")

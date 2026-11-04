@@ -1034,10 +1034,55 @@ Return what it wrote to standard error, trimmed, or nil."
     (spyglass--guard connection (funcall f connection t)))
   (spyglass--set-state connection 'closed))
 
+(defvar spyglass--reconnect-delays (make-hash-table :test #'eq :weakness 'key)
+  "Delays of reconnection of connections given their own, by connection.")
+
+(defun spyglass--delays-problem (delays)
+  "Return why DELAYS, a list of seconds, cannot space attempts, or nil."
+  (unless (and (consp delays) (proper-list-p delays)
+               (cl-every (lambda (delay) (and (numberp delay) (>= delay 0) (< delay 1.0e+INF)))
+                         delays)
+               (> (car (last delays)) 0))
+    "a list of seconds, none negative, the last positive, is expected"))
+
+(defun spyglass-connection-set-reconnect-delays (connection delays)
+  "Have CONNECTION wait DELAYS, seconds, before each attempt to connect again.
+They replace `spyglass-reconnect-delays' for CONNECTION alone: the Nth
+attempt after a stream broke waits the Nth delay, attempts after the
+last repeating at its delay, as an application backing off a peer that
+stays unreachable needs.  Nil keeps the default.  Signal an error when
+DELAYS is not a list of numbers, none negative, the last positive.  An
+attempt already scheduled keeps its time."
+  (when-let* ((problem (and delays (spyglass--delays-problem delays))))
+    (error "Spyglass reconnection of %s: %s" (spyglass-connection-label connection) problem))
+  (if delays
+      (puthash connection (copy-sequence delays) spyglass--reconnect-delays)
+    (remhash connection spyglass--reconnect-delays)))
+
+(defun spyglass--connection-delays (connection)
+  "Return the delays of CONNECTION's attempts to connect again.
+Those `spyglass-connection-set-reconnect-delays' gave, else
+`spyglass-reconnect-delays', else, when that option was set wrong, its
+standard value."
+  (or (gethash connection spyglass--reconnect-delays)
+      (and (not (spyglass--delays-problem spyglass-reconnect-delays)) spyglass-reconnect-delays)
+      (eval (car (get 'spyglass-reconnect-delays 'standard-value)) t)))
+
+(defun spyglass-connection-next-attempt (connection)
+  "Return the seconds before CONNECTION next tries to connect, or nil.
+Nil while it is connected, connecting, accepted (its peer connects
+again), or closed."
+  (let ((timer (spyglass-connection-timer connection)))
+    (and (eq (spyglass-connection-state connection) 'reconnecting)
+         (spyglass-connection-transport connection)
+         (not (spyglass-connection-process connection))
+         (timerp timer)
+         (max 0.0 (float-time (time-subtract (timer--time timer) nil))))))
+
 (defun spyglass--schedule-reconnect (connection)
   "Try to connect CONNECTION again after the next delay."
   (let* ((n (spyglass-connection-attempts connection))
-         (delays spyglass-reconnect-delays)
+         (delays (spyglass--connection-delays connection))
          (delay (if (< n (length delays)) (nth n delays) (car (last delays)))))
     (spyglass--cancel-timer connection)
     (setf (spyglass-connection-timer connection)
@@ -1157,7 +1202,7 @@ Its mirrors close and the subscriptions of its peer end."
         (delete-process process))
       (spyglass--lost connection))))
 
-(defun spyglass-reconnect (connection)
+(defun spyglass-reconnect (connection &optional fresh)
   "Break CONNECTION's stream and have it come back, as after a failure.
 For applications finding the peer unresponsive, a request timing out
 for instance: mirrors, subscriptions and channels resume on the next
@@ -1165,11 +1210,16 @@ stream as after a network failure; the peer is not told.  A
 connection made through a transport connects again, at once if it was
 waiting to; one the server accepted waits for its peer, which
 connects again when it notices the broken stream.  A failed write
-drops the stream by itself.  Return non-nil when a stream was broken
+drops the stream by itself.  With FRESH, the delays of the attempts
+that may follow start over, as for a stream that just broke: for an
+application that has reason to think its peer is back, the network
+having changed for instance.  Return non-nil when a stream was broken
 or an attempt to connect is under way, nil when CONNECTION is closed
 or waits for its peer."
   (let ((process (spyglass-connection-process connection))
         (transport (spyglass-connection-transport connection)))
+    (when fresh
+      (setf (spyglass-connection-attempts connection) 0))
     (cond
      ((eq (spyglass-connection-state connection) 'closed) nil)
      ((process-live-p process)
