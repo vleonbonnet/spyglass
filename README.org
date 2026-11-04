@@ -117,7 +117,8 @@ The owner sends, for each viewer, the ranges it has not seen, read from the buff
 #+begin_src sh
   make compile lint test     # byte-compile without warnings, checkdoc, ERT
   make test EAT_EL=DIR       # also the Eat test, with eat.el in DIR
-  make test-gui GHOSTEL_EL=DIR GHOSTEL_MODULE_DIR=DIR  # parking, in a graphical Emacs
+  make test-one FILE=test/spyglass-conn-test.el SELECTOR=regexp  # one file, some of its tests
+  make test-gui GHOSTEL_EL=DIR GHOSTEL_MODULE_DIR=DIR  # parking, in a graphical Emacs out of sight
   make bench                 # two batch Emacs through 127.0.0.1
   make bench BENCH_REMOTE=host BENCH_SSH=ssh BENCH_REMOTE_EMACS=emacs
   make lag LAG_SSH_HOST=localhost  # how long attempts to connect keep Emacs waiting

@@ -18,8 +18,9 @@
 ;;; Commentary:
 
 ;; Parking frames need a graphical display, which batch Emacs lacks:
-;; `make test-gui' runs these tests in a graphical Emacs started
-;; iconified, which writes the results to SPYGLASS_GUI_LOG and exits.
+;; `make test-gui' runs these tests in a graphical Emacs started by
+;; test/gui-emacs.sh, its frames visible but out of sight, which writes
+;; the results to SPYGLASS_GUI_LOG and exits.
 ;; This Emacs is owner and viewer, except for the test of a Ghostel
 ;; terminal mirrored by another Emacs, the benchmark's agent, a batch
 ;; Emacs.  It kills itself past 2 GB of resident memory.
@@ -142,7 +143,8 @@
   (spyglass-test-with-connection connection
     (let* ((buffer (generate-new-buffer "surrogate"))
            (first (selected-frame))
-           (second (make-frame '((visibility . icon)))))
+           ;; As visible as the first: an iconified frame goes to the Dock.
+           (second (make-frame `((visibility . ,(frame-visible-p first))))))
       (unwind-protect
           (let ((mirror (progn (spyglass-share buffer :needs-window t)
                                (spyglass-test-mirror connection buffer))))
@@ -163,11 +165,13 @@
 
 (defmacro spyglass-gui-test--with-visible-frame (&rest body)
   "Run BODY with the selected frame visible and its echo area empty.
-Then iconify the frame again.  A mirror reports the size of windows on
-visible frames only."
+Then iconify the frame again if it was.  A mirror reports the size of
+windows on visible frames only."
   (declare (indent 0) (debug t))
-  (let ((frame (make-symbol "frame")))
-    `(let ((,frame (selected-frame)))
+  (let ((frame (make-symbol "frame"))
+        (visibility (make-symbol "visibility")))
+    `(let* ((,frame (selected-frame))
+            (,visibility (frame-visible-p ,frame)))
        (unwind-protect
            (progn
              (make-frame-visible ,frame)
@@ -177,7 +181,8 @@ visible frames only."
              (message nil)
              (redisplay t)
              ,@body)
-         (when (frame-live-p ,frame) (iconify-frame ,frame))))))
+         (when (and (frame-live-p ,frame) (eq ,visibility 'icon))
+           (iconify-frame ,frame))))))
 
 (defun spyglass-gui-test--tty-size (process)
   "Return the size PROCESS's pty has, (COLUMNS . ROWS), as `stty' reads it."
