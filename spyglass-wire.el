@@ -557,7 +557,7 @@ zero, display specifications.  STRING longer than
   "Text properties a mirror may receive, in the order they are kept.")
 
 (defconst spyglass-wire-overlay-properties
-  '(face invisible display before-string after-string help-echo priority)
+  '(face invisible display line-prefix wrap-prefix before-string after-string help-echo priority)
   "Overlay properties a mirror may receive, in the order they are kept.")
 
 (defconst spyglass-wire-style-properties
@@ -581,6 +581,32 @@ zero, display specifications.  STRING longer than
     ('help-echo (and (stringp value) (spyglass-wire-sanitize-string value 0)))
     ('priority (and (integerp value) value))
     (_ nil)))
+
+(defun spyglass-wire-face-names (value &optional depth)
+  "Return the face names of the strings in VALUE, a sanitized value, or nil.
+The faces of strings, as a display string's or an overlay's
+`before-string' holds them, of display specifications in them, nested
+at most DEPTH (4 by default) deep, and in lists and vectors."
+  (let ((depth (or depth 4)) names)
+    (cl-labels ((faces (face)
+                  (cond ((and face (symbolp face) (not (keywordp face))) (push face names))
+                        ((and (consp face) (keywordp (car face)))
+                         (let ((inherit (plist-get face :inherit)))
+                           (if (listp inherit) (mapc #'faces inherit) (faces inherit))))
+                        ((consp face) (mapc #'faces face))))
+                (walk (value depth)
+                  (when (> depth 0)
+                    (cond ((stringp value)
+                           (dolist (iv (object-intervals value))
+                             (faces (plist-get (caddr iv) 'face))
+                             (walk (plist-get (caddr iv) 'display) (1- depth))))
+                          ((vectorp value) (mapc (lambda (v) (walk v (1- depth))) value))
+                          ((consp value)
+                           (while (consp value)
+                             (walk (car value) (1- depth))
+                             (setq value (cdr value))))))))
+      (walk value depth))
+    (delete-dups names)))
 
 (defun spyglass-wire-sanitize-props (plist allowed)
   "Return the properties of PLIST among ALLOWED, sanitized.

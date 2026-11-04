@@ -126,7 +126,8 @@ size, and `process-tty-name' is nil."
               (split-window nil 30 t)
               (spyglass-window-test--report mirror)
               (let ((size (spyglass-window-cells (selected-window))))
-                (should (equal (cdr size) 6))
+                ;; Eight lines, its mode line one: the owner has no header line.
+                (should (equal (cdr size) 7))
                 (spyglass-test-wait (lambda () (equal (spyglass-window-test--tty-size process) size)))
                 (should (equal (spyglass-window-test--tty-size process) size))
                 ;; Viewers learn the terminal's size.

@@ -586,6 +586,101 @@ see /dev."
               (spyglass-test-converge buffer mirror)))
         (spyglass-e2e--kill-comint buffer)))))
 
+(ert-deftest spyglass-e2e-faces-in-strings-fall-back ()
+  "Faces of the strings an overlay shows, as a label's display string, reach viewers lacking them."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "labels"
+      (insert "Claude> ")
+      (let ((label (make-overlay 1 2)))
+        (overlay-put label 'display (concat (propertize " Me " 'face 'spyglass-e2e-test-face) "\n"))
+        (overlay-put label 'line-prefix "")
+        (overlay-put label 'wrap-prefix "  "))
+      (let* ((mirror (spyglass-test-mirror connection (current-buffer)))
+             (faces (spyglass--mirror-faces (buffer-local-value 'spyglass--mirror mirror))))
+        (spyglass-test-wait (lambda () (gethash "spyglass-e2e-test-face" faces)))
+        ;; Its attributes as the owner resolves them, for a viewer without it.
+        (should (equal (plist-get (gethash "spyglass-e2e-test-face" faces) :foreground) "orange"))
+        (should (eq (plist-get (gethash "spyglass-e2e-test-face" faces) :slant) 'italic))
+        ;; The overlay's prefixes come along: they change the look of its lines.
+        (spyglass-test-wait (lambda () (with-current-buffer mirror
+                                         (seq-some (lambda (ov) (overlay-get ov 'wrap-prefix))
+                                                   (overlays-in (point-min) (point-max))))))
+        (let ((ov (with-current-buffer mirror
+                    (seq-find (lambda (ov) (overlay-get ov 'display)) (overlays-in (point-min) (point-max))))))
+          (should (equal (overlay-get ov 'line-prefix) ""))
+          (should (equal (overlay-get ov 'wrap-prefix) "  "))
+          (should (eq (get-text-property 1 'face (overlay-get ov 'display)) 'spyglass-e2e-test-face)))))))
+
+(ert-deftest spyglass-e2e-cursor-at-the-end ()
+  "The owner's cursor at the end of the buffer takes the window's cursor, not the cell before it."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "cursor-end"
+      (insert "Claude> ")
+      (let ((mirror (spyglass-test-mirror connection (current-buffer))))
+        (spyglass-test-wait (lambda () (eql (spyglass-mirror-owner-point mirror) (with-current-buffer mirror (point-max)))))
+        (let ((cursor (spyglass--mirror-cursor (buffer-local-value 'spyglass--mirror mirror))))
+          (should (= (overlay-start cursor) (with-current-buffer mirror (point-max))))
+          (should (get-text-property 0 'cursor (overlay-get cursor 'after-string))))))))
+
+(ert-deftest spyglass-e2e-mode-line-header-line-and-remapping ()
+  "A mirror shows the owner's mode line and header line, as its window renders them, and its face remapping."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "lines"
+      (insert "text\n")
+      (setq-local mode-line-format '("OWNER-ML %b"))
+      (setq-local header-line-format "OWNER-HL")
+      (face-remap-add-relative 'bold :foreground "red")
+      (let ((owner (current-buffer))
+            (rendered nil))
+        ;; A batch Emacs renders no mode line: the owner's rendering is
+        ;; stood for, telling the window it was given.
+        (cl-letf (((symbol-function 'format-mode-line)
+                   (lambda (format &optional _face window buffer)
+                     (cond ((and (eq buffer owner) (equal format '("OWNER-ML %b")))
+                            (push window rendered)
+                            (concat (propertize "OWNER-ML" 'face 'spyglass-e2e-test-face) " lines 100%"))
+                           ((and (eq buffer owner) (equal format "OWNER-HL")) "OWNER-HL")
+                           (t "")))))
+          (save-window-excursion
+            (set-window-buffer (selected-window) owner)
+            (let* ((mirror (spyglass-test-mirror connection owner))
+                   (m (buffer-local-value 'spyglass--mirror mirror)))
+              (spyglass-test-wait (lambda () (plist-get (gethash m spyglass--mirror-lines) :mode-line)))
+              ;; Rendered in the window showing it there.
+              (should (eq (car rendered) (selected-window)))
+              (with-current-buffer mirror
+                (let ((line (spyglass--mirror-mode-line)))
+                  ;; The owner's, its percent sign kept as such.
+                  (should (equal (substring-no-properties (car line)) "OWNER-ML lines 100%%"))
+                  (should (eq (get-text-property 0 'face (car line)) 'spyglass-e2e-test-face))
+                  ;; The mirror's own state, compactly, after it.
+                  (should (string-match-p "@self \\[live\\]" (cadr line))))
+                (should (equal (spyglass--mirror-header-line) "OWNER-HL"))
+                (should header-line-format)
+                (should (assq 'bold face-remapping-alist)))))
+          ;; No window of the owner's shows it: the mode line the
+          ;; application gives, the header still the owner's.
+          (let* ((mirror (car (spyglass-mirrors connection)))
+                 (m (buffer-local-value 'spyglass--mirror mirror)))
+            (setf (spyglass-share-meta-time (spyglass-share-of owner)) 0.0)
+            (insert "more\n")
+            (spyglass-test-wait (lambda () (null (plist-get (gethash m spyglass--mirror-lines) :mode-line))))
+            (with-current-buffer mirror
+              (setq-local spyglass-mirror-mode-line-function (lambda () "FROM-APPLICATION"))
+              (should (equal (car (spyglass--mirror-mode-line)) "FROM-APPLICATION"))
+              (setq-local spyglass-mirror-mode-line-function nil)
+              (should (eq (car (spyglass--mirror-mode-line)) (default-value 'mode-line-format)))
+              (should (equal (spyglass--mirror-header-line) "OWNER-HL"))))
+          ;; The remapping gone there, and the header line: gone here.
+          (setq-local face-remapping-alist nil)
+          (setq-local header-line-format nil)
+          (setf (spyglass-share-meta-time (spyglass-share-of owner)) 0.0)
+          (insert "again\n")
+          (let ((mirror (car (spyglass-mirrors connection))))
+            (spyglass-test-wait (lambda () (null (buffer-local-value 'face-remapping-alist mirror))))
+            (should-not (buffer-local-value 'face-remapping-alist mirror))
+            (should-not (buffer-local-value 'header-line-format mirror))))))))
+
 (ert-deftest spyglass-e2e-reconnect-resumes ()
   "A broken stream comes back, and the mirror resumes where it was."
   (spyglass-test-with-connection connection

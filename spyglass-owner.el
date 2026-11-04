@@ -138,11 +138,12 @@ the next flush, at once."
               (const line-prefix) (const wrap-prefix) (const help-echo)))
 
 (defcustom spyglass-overlay-properties
-  '(face invisible display before-string after-string priority)
+  '(face invisible display line-prefix wrap-prefix before-string after-string priority)
   "Overlay properties mirrored, among `spyglass-wire-overlay-properties'.
 Overlays with none of these but `priority' are not mirrored."
   :group 'spyglass
   :type '(set (const face) (const invisible) (const display)
+              (const line-prefix) (const wrap-prefix)
               (const before-string) (const after-string)
               (const help-echo) (const priority)))
 
@@ -1008,12 +1009,65 @@ off; polling captures again later."
                          buffer-invisibility-spec)))
     t))
 
+(defconst spyglass--mode-line-limit 500
+  "Characters at most of the owner's mode line or header line sent to viewers.")
+
+(defconst spyglass--remap-limit 32
+  "Faces at most of the owner's buffer's remapping sent to viewers.")
+
+(defun spyglass--render-window ()
+  "Return a window showing the current buffer, to render its mode line in, or nil.
+An owner's window, else its parking window: a mode line rendered without
+one shows the selected window's buffer in its parts reading it."
+  (let ((windows (get-buffer-window-list (current-buffer) nil t)))
+    (or (cl-find-if-not (lambda (window) (frame-parameter (window-frame window) 'spyglass-parking))
+                        windows)
+        (car windows))))
+
+(defun spyglass--render-line (format window)
+  "Return FORMAT, a mode line construct, rendered in WINDOW for this buffer.
+Sanitized, bounded to `spyglass--mode-line-limit' characters; nil when
+empty or it cannot be."
+  (when format
+    (let ((line (condition-case nil
+                    (format-mode-line format nil window (current-buffer))
+                  (error nil))))
+      (when (and line (not (string-blank-p line)))
+        (spyglass-wire-sanitize-string
+         (if (> (length line) spyglass--mode-line-limit)
+             (substring line 0 spyglass--mode-line-limit)
+           line))))))
+
+(defun spyglass--face-remapping ()
+  "Return this buffer's face remapping as viewers get it, or nil.
+A vector of [FACE SPECS], each face's remapping sanitized, at most
+`spyglass--remap-limit' of them."
+  (let (out (n 0))
+    (dolist (entry face-remapping-alist)
+      (when (and (< n spyglass--remap-limit) (consp entry) (symbolp (car entry)) (car entry))
+        (let ((specs (spyglass-wire-sanitize-face (if (listp (cdr entry)) (cdr entry) (list (cdr entry))))))
+          (when specs
+            (cl-incf n)
+            (push (vector (symbol-name (car entry)) (spyglass-wire-encode (ensure-list specs))) out)))))
+    (and out (vconcat (nreverse out)))))
+
 (defun spyglass--compute-meta (share)
-  "Return the description of SHARE's buffer sent to viewers."
-  (let ((header (and header-line-format
-                     (condition-case nil
-                         (format-mode-line header-line-format nil nil (current-buffer))
-                       (error nil)))))
+  "Return the description of SHARE's buffer sent to viewers.
+Its mode line and header line are rendered in a window showing the
+buffer, its mode line only then (see `spyglass--render-window'); the
+faces they and the remapping name are noted for viewers lacking them."
+  (let* ((window (spyglass--render-window))
+         (header (spyglass--render-line header-line-format window))
+         (mode-line (and window (spyglass--render-line mode-line-format window)))
+         (remap (spyglass--face-remapping)))
+    (puthash share (plist-put (gethash share spyglass--share-options) :meta-faces
+                              (delete-dups
+                               (append (spyglass-wire-face-names header)
+                                       (spyglass-wire-face-names mode-line)
+                                       (mapcan (lambda (entry)
+                                                 (spyglass--face-names (cons (car entry) (cdr entry))))
+                                               (seq-take face-remapping-alist spyglass--remap-limit)))))
+             spyglass--share-options)
     (append
      (list :name (spyglass-wire-plain-string (buffer-name))
            :mode (spyglass-wire-plain-string
@@ -1021,9 +1075,9 @@ off; polling captures again later."
            :tw tab-width :tl (if truncate-lines t :false)
            :ww (if word-wrap t :false)
            :inv (spyglass--invisibility-spec)
-           :hl (if (and header (not (string-empty-p header)))
-                   (spyglass-wire-encode (spyglass-wire-sanitize-string header))
-                 :false)
+           :hl (if header (spyglass-wire-encode header) :false)
+           :ml (if mode-line (spyglass-wire-encode mode-line) :false)
+           :fr (or remap :false)
            :fl (if (spyglass-share-jit share) t :false)
            ;; A function decides per viewer: see `spyglass--meta-for'.
            :in (if (and (spyglass-share-read-only share)
@@ -1117,13 +1171,21 @@ New styles and the faces they name are added to ACC, a cons of lists
             (let ((sid (cl-incf (spyglass--sub-next-style sub))))
               (puthash raw sid (spyglass--sub-styles sub))
               (push (vector sid (spyglass-wire-encode clean)) (car acc))
-              (dolist (face (spyglass--face-names (plist-get clean 'face)))
-                (unless (gethash face (spyglass--sub-faces sub))
-                  (puthash face t (spyglass--sub-faces sub))
-                  (push (vector (symbol-name face)
-                                (spyglass-wire-encode (spyglass--face-fallback face)))
-                        (cdr acc))))
+              (spyglass--define-faces sub (append (spyglass--face-names (plist-get clean 'face))
+                                                  (spyglass-wire-face-names clean))
+                                      acc)
               sid))))))
+
+(defun spyglass--define-faces (sub faces acc)
+  "Have SUB's viewer learn the attributes of FACES it was not sent yet.
+Each goes to ACC's face definitions, as the owner resolves it, for a
+viewer lacking the face, which shows those attributes instead."
+  (dolist (face faces)
+    (unless (gethash face (spyglass--sub-faces sub))
+      (puthash face t (spyglass--sub-faces sub))
+      (push (vector (symbol-name face)
+                    (spyglass-wire-encode (spyglass--face-fallback face)))
+            (cdr acc)))))
 
 (defun spyglass--runs (sub text acc)
   "Return the runs of styles of TEXT for SUB, as a flat vector.
@@ -1227,7 +1289,9 @@ only: each is told whether it may type."
       (when (or ops ovs dels send-pt send-ws send-meta reset styles-reset)
         (when send-pt (setf (spyglass--sub-point sub) pt))
         (when send-ws (setf (spyglass--sub-window-start sub) ws))
-        (when send-meta (setf (spyglass--sub-meta sub) meta))
+        (when send-meta
+          (setf (spyglass--sub-meta sub) meta)
+          (spyglass--define-faces sub (spyglass--share-option share :meta-faces) acc))
         (let ((header
                (append
                 (list :t "u" :sub (spyglass--sub-id sub)

@@ -43,6 +43,7 @@
 (require 'cl-lib)
 (require 'spyglass-wire)
 (require 'spyglass-conn)
+(require 'face-remap)
 
 (declare-function spyglass-share-of "spyglass-owner" (buffer))
 
@@ -215,7 +216,9 @@ sends it.  Keys typed go to the owner when its share takes input.
         ;; Faces come from the owner: font lock would strip them.
         font-lock-defaults nil)
   (setq-local font-lock-global-modes nil)
-  (setq-local header-line-format '(:eval (spyglass--mirror-header-line)))
+  ;; The owner's header line, once it tells one.
+  (setq-local header-line-format nil)
+  (setq-local mode-line-format '("%e" (:eval (spyglass--mirror-mode-line))))
   (setq-local mode-name '(:eval (spyglass--mirror-mode-name)))
   (add-hook 'kill-buffer-hook #'spyglass--mirror-killed nil t))
 
@@ -226,31 +229,64 @@ sends it.  Keys typed go to the owner when its share takes input.
         (concat "Spyglass:" (plist-get meta :mode))
       "Spyglass")))
 
-(defun spyglass--mirror-header-line ()
-  "Return the header line of a mirror: where it comes from and its state."
+(defvar spyglass--mirror-lines (make-hash-table :test #'eq :weakness 'key)
+  "What each mirror shows of its owner beyond its text, a plist, by mirror.
+`:mode-line', the owner's mode line, its faces resolved, or nil;
+`:remaps', the cookies of the owner's face remapping applied here.")
+
+(defvar-local spyglass-mirror-mode-line-function nil
+  "Function returning the mode line of this mirror while its owner sends none.
+Called with no argument in the mirror; a string, or nil for Emacs's own
+mode line.  The owner sends its mode line while a window there shows the
+buffer: rendered without one, its parts reading the selected window's
+buffer would tell another buffer's.  An application sets it, as drover
+does from what it knows of the session mirrored.")
+
+(defun spyglass--mirror-state-line (mirror)
+  "Return what MIRROR's mode line tells of the mirror: where from, its state.
+The title or the share, the owner, live, opening, reconnecting or closed
+and why, the terminal's size, and whether input is refused."
+  (let* ((state (spyglass--mirror-state mirror))
+         (label (spyglass-connection-label (spyglass--mirror-connection mirror)))
+         (state-text
+          (propertize (pcase state
+                        ('live "live")
+                        ('opening "opening")
+                        ('reconnecting "reconnecting")
+                        ('closed (format "closed%s"
+                                         (if (spyglass--mirror-reason mirror)
+                                             (concat ": " (spyglass--mirror-reason mirror))
+                                           ""))))
+                      'face (pcase state
+                              ('live 'spyglass-state-live)
+                              ('closed 'spyglass-state-closed)
+                              (_ 'spyglass-state-waiting)))))
+    (concat " " (or (gethash mirror spyglass--mirror-titles) (spyglass--mirror-share mirror))
+            "@" label " [" state-text "]"
+            (let ((grid (spyglass--mirror-grid mirror)))
+              (if grid (format " %d×%d" (car grid) (cdr grid)) ""))
+            (if (eq (plist-get (spyglass--mirror-meta mirror) :in) :false) " read-only" ""))))
+
+(defun spyglass--mirror-mode-line ()
+  "Return the mode line of a mirror, as a mode line construct.
+The owner's, as its window there renders it, else the one
+`spyglass-mirror-mode-line-function' gives, else Emacs's own; then,
+compactly, where the mirror comes from and its state."
   (when-let* ((mirror spyglass--mirror))
-    (let* ((state (spyglass--mirror-state mirror))
-           (label (spyglass-connection-label (spyglass--mirror-connection mirror)))
-           (state-text
-            (propertize (pcase state
-                          ('live "live")
-                          ('opening "opening")
-                          ('reconnecting "reconnecting")
-                          ('closed (format "closed%s"
-                                           (if (spyglass--mirror-reason mirror)
-                                               (concat ": " (spyglass--mirror-reason mirror))
-                                             ""))))
-                        'face (pcase state
-                                ('live 'spyglass-state-live)
-                                ('closed 'spyglass-state-closed)
-                                (_ 'spyglass-state-waiting)))))
-      (concat " " (or (gethash mirror spyglass--mirror-titles) (spyglass--mirror-share mirror))
-              "@" label " [" state-text "]"
-              (let ((grid (spyglass--mirror-grid mirror)))
-                (if grid (format " %d×%d" (car grid) (cdr grid)) ""))
-              (if (spyglass--mirror-header mirror)
-                  (concat "  " (string-replace "%" "%%" (spyglass--mirror-header mirror)))
-                "")))))
+    (let* ((owner (plist-get (gethash mirror spyglass--mirror-lines) :mode-line))
+           (fallback (and (not owner) spyglass-mirror-mode-line-function
+                          (condition-case nil (funcall spyglass-mirror-mode-line-function)
+                            (error nil)))))
+      (list (cond (owner (string-replace "%" "%%" owner))
+                  ((stringp fallback) (string-replace "%" "%%" fallback))
+                  (t (default-value 'mode-line-format)))
+            (string-replace "%" "%%" (spyglass--mirror-state-line mirror))))))
+
+(defun spyglass--mirror-header-line ()
+  "Return the header line of a mirror: the owner's, or nil while it has none."
+  (when-let* ((mirror spyglass--mirror)
+              (header (spyglass--mirror-header mirror)))
+    (string-replace "%" "%%" header)))
 
 ;;;; Opening and closing
 
@@ -637,7 +673,16 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
   (let ((hl (spyglass-wire-decode (plist-get meta :hl))))
     (setf (spyglass--mirror-header mirror)
           (and (stringp hl)
-               (spyglass--mirror-resolve-strings mirror (spyglass-wire-sanitize-string hl)))))
+               (spyglass--mirror-resolve-strings mirror (spyglass-wire-sanitize-string hl))))
+    (setq header-line-format (and (spyglass--mirror-header mirror)
+                                  '(:eval (spyglass--mirror-header-line)))))
+  (let ((ml (spyglass-wire-decode (plist-get meta :ml)))
+        (lines (gethash mirror spyglass--mirror-lines)))
+    (puthash mirror (plist-put lines :mode-line
+                               (and (stringp ml)
+                                    (spyglass--mirror-resolve-strings mirror (spyglass-wire-sanitize-string ml))))
+             spyglass--mirror-lines))
+  (spyglass--mirror-apply-remapping mirror (plist-get meta :fr))
   (if (eq (plist-get meta :fl) t)
       (unless (memq #'spyglass--mirror-jit (bound-and-true-p jit-lock-functions))
         (jit-lock-register #'spyglass--mirror-jit))
@@ -656,6 +701,30 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
         (spyglass--mirror-watch-windows)
         (spyglass--mirror-schedule-report))))
   (force-mode-line-update))
+
+(defun spyglass--mirror-apply-remapping (mirror remaps)
+  "Remap faces in MIRROR's buffer as REMAPS, the owner's remapping, says.
+Each face as the owner's buffer remaps it, faces it names resolved as
+the owner's attributes for those unknown here; relative to the viewer's
+own remapping, which a text scale here keeps."
+  (let* ((lines (gethash mirror spyglass--mirror-lines))
+         (old (plist-get lines :remaps))
+         (new (and (vectorp remaps)
+                   (delq nil (mapcar (lambda (entry)
+                                       (and (vectorp entry) (= (length entry) 2) (stringp (aref entry 0))
+                                            (let ((specs (spyglass-wire-sanitize-face
+                                                          (spyglass-wire-decode (aref entry 1)))))
+                                              (and specs (cons (intern (aref entry 0))
+                                                               (spyglass--mirror-resolve-face
+                                                                mirror (ensure-list specs)))))))
+                                     (seq-take remaps 32))))))
+    (unless (equal new (plist-get lines :remap-specs))
+      (mapc #'face-remap-remove-relative old)
+      (puthash mirror (plist-put (plist-put lines :remap-specs new) :remaps
+                                 (mapcar (lambda (entry)
+                                           (apply #'face-remap-add-relative (car entry) (cdr entry)))
+                                         new))
+               spyglass--mirror-lines))))
 
 (defun spyglass--mirror-apply-point (mirror pt)
   "Show the owner's cursor of MIRROR at PT, and follow it in windows there."
@@ -681,7 +750,9 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
               (overlay-put cursor 'face 'spyglass-cursor))
           (move-overlay cursor pt pt)
           (overlay-put cursor 'face nil)
-          (overlay-put cursor 'after-string (propertize " " 'face 'spyglass-cursor)))))))
+          ;; The window's cursor goes on it: after it, the viewer's point
+          ;; there would show a cell right of the owner's cursor.
+          (overlay-put cursor 'after-string (propertize " " 'face 'spyglass-cursor 'cursor t)))))))
 
 (defun spyglass--mirror-jit (beg end)
   "Ask the owner to fontify BEG..END, which redisplay shows here."

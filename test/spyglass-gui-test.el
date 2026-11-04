@@ -70,6 +70,33 @@
     (should (window-dedicated-p window))
     (should (window-parameter window 'no-other-window))))
 
+(ert-deftest spyglass-gui-mirror-shows-the-owners-mode-line ()
+  "A mirror's mode line is the owner's, rendered in the owner's window: its buffer, not the selected one's."
+  (spyglass-test-with-connection connection
+    (let ((buffer (generate-new-buffer "owner-lines"))
+          (config (current-window-configuration)))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (insert "text\n")
+              (setq-local mode-line-format '("OWNER " (:eval (buffer-name)) " %b"))
+              (setq-local header-line-format '("HEADER " (:eval (buffer-name)))))
+            (set-window-buffer (selected-window) buffer)
+            (let ((mirror (spyglass-test-mirror connection buffer)))
+              ;; The selected window shows the mirror, the owner's another.
+              (set-window-buffer (split-window) mirror)
+              (select-window (get-buffer-window mirror))
+              (spyglass-test-wait (lambda () (with-current-buffer mirror
+                                               (string-prefix-p "OWNER" (format-mode-line mode-line-format)))))
+              (with-current-buffer mirror
+                (should (string-prefix-p "OWNER owner-lines owner-lines" (format-mode-line mode-line-format)))
+                (should (string-match-p "owner-lines@self \\[live\\]" (format-mode-line mode-line-format)))
+                (should (equal (format-mode-line header-line-format) "HEADER owner-lines")))
+              (kill-buffer mirror)))
+        (set-window-configuration config)
+        (delete-other-windows)
+        (kill-buffer buffer)))))
+
 (ert-deftest spyglass-gui-parks-and-releases ()
   "A buffer needing a window is parked while viewers watch it and no window shows it."
   (spyglass-test-with-connection connection

@@ -143,8 +143,8 @@ ACCEPTED-B their ends the server accepted, which shares see."
       (spyglass-share (current-buffer) :id "again")
       (let* ((mirror (spyglass-open connection "again" :title "My terminal")))
         (spyglass-test-converge (current-buffer) mirror)
-        (should (string-match-p "\\` My terminal@" (with-current-buffer mirror
-                                                      (spyglass--mirror-header-line))))
+        (should (string-match-p "\\` My terminal@" (spyglass--mirror-state-line
+                                                     (buffer-local-value 'spyglass--mirror mirror))))
         (should-error (spyglass-open connection "other" :buffer mirror))
         (spyglass-close mirror)
         (insert "second\n")
@@ -154,7 +154,8 @@ ACCEPTED-B their ends the server accepted, which shares see."
           (spyglass-test-converge (current-buffer) mirror)
           (should (eq (window-buffer (selected-window)) mirror))
           (should (eq (spyglass-mirror-state mirror) 'live))
-          (should (string-match-p "\\` Again@" (with-current-buffer mirror (spyglass--mirror-header-line)))))
+          (should (string-match-p "\\` Again@" (spyglass--mirror-state-line
+                                                (buffer-local-value 'spyglass--mirror mirror)))))
         (kill-buffer mirror)))))
 
 (ert-deftest spyglass-peers-reconnect-delays ()
