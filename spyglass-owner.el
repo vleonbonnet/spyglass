@@ -69,6 +69,7 @@
 (declare-function comint-previous-input "comint" (arg))
 (declare-function comint-next-input "comint" (arg))
 (defvar jit-lock-mode)
+(defvar comint-last-prompt)
 (defvar jit-lock-functions)
 
 ;;;; Options
@@ -175,8 +176,22 @@ Nil means `comint-send-input'.  A front end such as agent-shell sets
 its own submit command here.")
 
 (defvar-local spyglass-point-function nil
-  "Function returning the position viewers follow, or nil for point.
-Terminal adapters return the terminal's cursor.")
+  "Function returning the position viewers follow, or nil for the default.
+Terminal adapters return the terminal's cursor.  The default is the
+input point of a comint buffer (`spyglass-comint-input-point'), where
+viewers' input goes, else the point of a window of the owner's showing
+the buffer, else the buffer's point.")
+
+(defvar-local spyglass-key-commands nil
+  "Commands viewers' keys run in this buffer, an alist (KEY . COMMAND).
+KEY is a key as viewers send it, in `key-description' form, such as
+\"RET\" or \"C-c\" (what a mirror's C-c C-c sends); COMMAND a command,
+run interactively in the buffer at its input, or a function of no
+argument.  Keys are never looked up in the owner's keymaps: an
+application lists here the commands it lets viewers run, as drover lists
+those a front end binds in its shells, such as agent-shell's
+`agent-shell-submit' for RET.  Comint buffers honor it; terminals send
+keys to their programs.")
 
 (defvar-local spyglass--share nil
   "The share of this buffer, or nil.")
@@ -1016,6 +1031,17 @@ off; polling captures again later."
                    :false t))
      (mapcan (lambda (f) (copy-sequence (funcall f share))) spyglass--meta-functions))))
 
+(defun spyglass--followed-point ()
+  "Return the position viewers follow in the current buffer, a shared one.
+See `spyglass-point-function'."
+  (let ((pos (and spyglass-point-function
+                  (condition-case nil (funcall spyglass-point-function)
+                    (error nil)))))
+    (cond ((number-or-marker-p pos) (max (point-min) (min (point-max) (+ 0 pos))))
+          ((derived-mode-p 'comint-mode) (spyglass-comint-input-point))
+          (t (let ((window (get-buffer-window (current-buffer) t)))
+               (if window (window-point window) (point)))))))
+
 (defun spyglass--refresh-share-state (share)
   "Compute what SHARE's viewers follow: point, window start, description.
 When `font-lock-face' starts or stops showing, as font lock turns on
@@ -1027,13 +1053,7 @@ or off, every viewer gets the whole buffer again."
       (unless (or (eq old :unknown) (zerop (buffer-size)))
         (spyglass--capture-changes share (list (list 1 (buffer-size) (buffer-size)))))))
   (let ((window (get-buffer-window (current-buffer) t)))
-    (setf (spyglass-share-point share)
-          (let ((pos (and spyglass-point-function
-                          (condition-case nil (funcall spyglass-point-function)
-                            (error nil)))))
-            (if (number-or-marker-p pos)
-                (max (point-min) (min (point-max) (+ 0 pos)))
-              (if window (window-point window) (point))))
+    (setf (spyglass-share-point share) (spyglass--followed-point)
           (spyglass-share-window-start share) (and window (window-start window))))
   (let ((now (float-time)))
     (when (or (null (spyglass-share-meta share))
@@ -1397,13 +1417,7 @@ just captured."
                       (spyglass-share-hints share)
                       (spyglass-share-hint-all share)
                       (> (- now (spyglass-share-meta-time share)) 0.5)
-                      (let ((window (get-buffer-window (current-buffer) t))
-                            (pos (and spyglass-point-function
-                                      (ignore-errors (funcall spyglass-point-function)))))
-                        (not (eql (if (number-or-marker-p pos)
-                                      (+ 0 pos)
-                                    (if window (window-point window) (point)))
-                                  (spyglass-share-point share)))))
+                      (not (eql (spyglass--followed-point) (spyglass-share-point share))))
               (spyglass--schedule-flush))
             (when (and (eq (spyglass-share-mode share) 'shadow)
                        (> (- now (spyglass-share-sweep-time share))
@@ -1590,10 +1604,13 @@ just captured."
              ((and (eq kind 'key) (not (key-valid-p value))) "invalid key")
              (t (condition-case err
                     (with-current-buffer (spyglass-share-buffer share)
-                      (funcall (or (spyglass-share-input share)
-                                   spyglass-input-function
-                                   #'spyglass-default-input)
-                               kind value)
+                      ;; A viewer's input never has the owner's Emacs
+                      ;; wait for its user: what would ask fails instead.
+                      (let ((inhibit-interaction t))
+                        (funcall (or (spyglass-share-input share)
+                                     spyglass-input-function
+                                     #'spyglass-default-input)
+                                 kind value))
                       nil)
                   (error (error-message-string err)))))))
       (if problem
@@ -1700,30 +1717,92 @@ Nil for keys a terminal cannot send."
            (let ((rest (spyglass-key-bytes (substring key 2))))
              (and rest (concat "\e" rest))))))
 
+(defun spyglass--comint-input-start ()
+  "Return where the input of this comint buffer starts.
+The process mark, else the end of the last prompt, else the end."
+  (let ((process (get-buffer-process (current-buffer))))
+    (cond ((and process (marker-position (process-mark process)))
+           (marker-position (process-mark process)))
+          ((and (consp (bound-and-true-p comint-last-prompt))
+                (markerp (cdr comint-last-prompt))
+                (marker-position (cdr comint-last-prompt)))
+           (marker-position (cdr comint-last-prompt)))
+          (t (point-max)))))
+
+(defun spyglass-comint-input-point ()
+  "Return where viewers' input goes in this comint buffer: its input point.
+Point, while it is in the input after the prompt, where the owner, or
+a viewer, edits it; else the end of the buffer.  Viewers' mirrors of a
+comint buffer show this as the owner's cursor."
+  (let ((start (spyglass--comint-input-start)))
+    (if (<= start (point) (point-max)) (point) (point-max))))
+
+(defun spyglass--comint-goto-input (old position)
+  "Move the input point of this comint buffer from OLD to POSITION.
+Point moves, and so do the owner's windows whose point was at OLD:
+those showing the prompt keep showing where input goes, those where
+the owner reads elsewhere stay."
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (when (eql (window-point window) old)
+      (set-window-point window position)))
+  (goto-char position))
+
+(defun spyglass--comint-command (key)
+  "Run the command `spyglass-key-commands' gives KEY in this buffer, if any.
+Return non-nil when there is one.  A command runs interactively, as the
+owner's key would run it."
+  (when-let* ((command (cdr (assoc key spyglass-key-commands))))
+    (if (commandp command)
+        (let ((current-prefix-arg nil)
+              (this-command command))
+          (call-interactively command))
+      (funcall command))
+    t))
+
 (defun spyglass--comint-input (kind value)
-  "Apply a viewer's input of KIND and VALUE in this comint buffer."
-  (let* ((process (get-buffer-process (current-buffer)))
-         (mark (and process (process-mark process))))
+  "Apply a viewer's input of KIND and VALUE in this comint buffer.
+Text goes in at the input point (see `spyglass-comint-input-point'),
+which moves past it, as typing there would; keys edit the input there,
+move it, or run what the buffer's `spyglass-key-commands' give them,
+else comint's own commands: RET submits through
+`spyglass-submit-function' or `comint-send-input', C-c interrupts, M-p
+and M-n, and the up and down arrows, recall the input history."
+  (let ((start (spyglass--comint-input-start))
+        (point (spyglass-comint-input-point)))
     (if (eq kind 'string)
-        (save-excursion
-          (goto-char (point-max))
-          (insert value))
-      (pcase value
-        ((or "RET" "<return>")
-         (goto-char (point-max))
-         (funcall (or spyglass-submit-function #'comint-send-input)))
-        ((or "DEL" "<backspace>")
-         (when (and mark (> (point-max) mark))
-           (delete-region (1- (point-max)) (point-max))))
-        ("C-c" (comint-interrupt-subjob))
-        ("C-d" (if (and mark (= (point-max) mark))
-                   (comint-send-eof)
-                 (delete-region (1- (point-max)) (point-max))))
-        ("C-u" (goto-char (point-max)) (comint-kill-input))
-        ((or "M-p" "<up>") (goto-char (point-max)) (comint-previous-input 1))
-        ((or "M-n" "<down>") (goto-char (point-max)) (comint-next-input 1))
-        ("TAB" (save-excursion (goto-char (point-max)) (insert "\t")))
-        (_ (user-error "Key %s is not forwarded to comint buffers" value))))))
+        (progn (goto-char point)
+               (insert value)
+               (spyglass--comint-goto-input point (point)))
+      ;; RET submits the whole input, from its end, as comint's does.
+      (goto-char (if (member value '("RET" "<return>")) (point-max) point))
+      (unless (spyglass--comint-command value)
+        (pcase value
+          ((or "RET" "<return>")
+           (goto-char (point-max))
+           (funcall (or spyglass-submit-function #'comint-send-input)))
+          ((or "DEL" "<backspace>")
+           (when (> point start)
+             (delete-region (1- point) point)
+             (spyglass--comint-goto-input point (1- point))))
+          ((or "<delete>" "<deletechar>")
+           (when (< point (point-max))
+             (delete-region point (1+ point))))
+          ("C-d" (if (= start (point-max))
+                     (comint-send-eof)
+                   (when (< point (point-max))
+                     (delete-region point (1+ point)))))
+          ((or "<left>" "C-b") (spyglass--comint-goto-input point (max start (1- point))))
+          ((or "<right>" "C-f") (spyglass--comint-goto-input point (min (point-max) (1+ point))))
+          ((or "<home>" "C-a") (spyglass--comint-goto-input point start))
+          ((or "<end>" "C-e") (spyglass--comint-goto-input point (point-max)))
+          ("C-c" (comint-interrupt-subjob))
+          ("C-u" (goto-char (point-max)) (comint-kill-input) (spyglass--comint-goto-input point (point-max)))
+          ((or "M-p" "<up>") (goto-char (point-max)) (comint-previous-input 1)
+           (spyglass--comint-goto-input point (point-max)))
+          ((or "M-n" "<down>") (goto-char (point-max)) (comint-next-input 1)
+           (spyglass--comint-goto-input point (point-max)))
+          ("TAB" (insert "\t") (spyglass--comint-goto-input point (point)))
+          (_ (user-error "Key %s is not forwarded to comint buffers" value)))))))
 
 (defun spyglass--text-input (kind value)
   "Apply a viewer's input of KIND and VALUE in this editable buffer, at point."

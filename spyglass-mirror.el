@@ -867,7 +867,22 @@ window showing it on a visible frame."
      ((eq (plist-get meta :in) :false)
       (user-error "Mirror %s is read-only: its owner takes no input from here" name))
      (t (spyglass--send connection (list :t "in" :sub (spyglass--mirror-id mirror)
-                                         :k (if (eq kind 'key) "k" "s") :v value))))))
+                                         :k (if (eq kind 'key) "k" "s") :v value))
+        (spyglass--mirror-to-owner-point mirror)))))
+
+(defun spyglass--mirror-to-owner-point (mirror)
+  "Bring the selected window's point back to MIRROR's owner's cursor.
+Point in a mirror is the viewer's own, to read where it likes; typing
+there goes to the owner's cursor (its input point in a shell), so
+point goes there too, and follows it again."
+  (let ((buffer (spyglass--mirror-buffer mirror))
+        (owner (spyglass--mirror-point mirror)))
+    (when (and owner (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (let ((owner (max (point-min) (min owner (point-max)))))
+          (when (eq (window-buffer (selected-window)) buffer)
+            (set-window-point (selected-window) owner))
+          (goto-char owner))))))
 
 (defun spyglass-mirror-send-string (string &optional mirror-or-buffer)
   "Send STRING as typed text to the owner of MIRROR-OR-BUFFER.

@@ -448,6 +448,144 @@ see /dev."
           (when (get-buffer-process buffer) (delete-process (get-buffer-process buffer)))
           (kill-buffer buffer))))))
 
+(defun spyglass-e2e--kill-comint (buffer)
+  "Kill BUFFER, a comint buffer, and its process."
+  (when (buffer-live-p buffer)
+    (let ((kill-buffer-query-functions nil))
+      (when (get-buffer-process buffer) (delete-process (get-buffer-process buffer)))
+      (kill-buffer buffer))))
+
+(defun spyglass-e2e--owner-point (mirror)
+  "Return the owner's cursor MIRROR shows, once it settled."
+  (spyglass-test-settle 0.1)
+  (spyglass-mirror-owner-point mirror))
+
+(ert-deftest spyglass-e2e-comint-input-point ()
+  "A viewer edits a shell's input at its input point, which its mirror shows and which moves as it types."
+  (skip-unless (executable-find "cat"))
+  (spyglass-test-with-connection connection
+    (let ((buffer (make-comint "spyglass-point" "cat")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (insert "output above\n")
+            (set-marker (process-mark (get-buffer-process buffer)) (point-max))
+            ;; The owner reads elsewhere: input still goes to the input.
+            (goto-char (point-min))
+            (let ((mirror (spyglass-test-mirror connection buffer))
+                  (start (marker-position (process-mark (get-buffer-process buffer)))))
+              (should (= (spyglass-e2e--owner-point mirror) (point-max)))
+              (spyglass-mirror-send-string "abc" mirror)
+              (spyglass-test-wait (lambda () (equal (buffer-substring start (point-max)) "abc")))
+              (should (= (point) (point-max)))
+              (should (= (spyglass-e2e--owner-point mirror) (with-current-buffer mirror (point-max))))
+              ;; Moved within the input, edits apply there.
+              (spyglass-mirror-send-key "<left>" mirror)
+              (spyglass-mirror-send-key "DEL" mirror)
+              (spyglass-mirror-send-string "X" mirror)
+              (spyglass-test-wait (lambda () (equal (buffer-substring start (point-max)) "aXc")))
+              (should (equal (buffer-substring start (point-max)) "aXc"))
+              (should (= (point) (+ start 2)))
+              (should (= (spyglass-e2e--owner-point mirror) (+ start 2)))
+              ;; Never into the output above.
+              (dotimes (_ 5) (spyglass-mirror-send-key "DEL" mirror))
+              (spyglass-mirror-send-key "<home>" mirror)
+              (spyglass-mirror-send-key "<left>" mirror)
+              (spyglass-test-wait (lambda () (equal (buffer-substring start (point-max)) "c")))
+              (should (equal (buffer-substring (point-min) (point-max)) "output above\nc"))
+              (should (= (spyglass-e2e--owner-point mirror) start))
+              (spyglass-test-converge buffer mirror)))
+        (spyglass-e2e--kill-comint buffer)))))
+
+(ert-deftest spyglass-e2e-mirror-point-returns-to-the-input ()
+  "A viewer reads where it likes in its mirror; typing brings its point back to the owner's cursor."
+  (skip-unless (executable-find "cat"))
+  (spyglass-test-with-connection connection
+    (let ((buffer (make-comint "spyglass-reader" "cat")))
+      (unwind-protect
+          (save-window-excursion
+            (with-current-buffer buffer
+              (dotimes (i 50) (insert (format "line %d\n" i)))
+              (set-marker (process-mark (get-buffer-process buffer)) (point-max)))
+            (let ((mirror (spyglass-test-mirror connection buffer)))
+              (spyglass-test-converge buffer mirror)
+              (set-window-buffer (selected-window) mirror)
+              (select-window (get-buffer-window mirror))
+              (goto-char (point-min))
+              (spyglass-mirror-send-string "typed" mirror)
+              (should (= (window-point) (spyglass-mirror-owner-point mirror)))
+              (spyglass-test-wait (lambda () (with-current-buffer mirror
+                                               (string-suffix-p "typed" (buffer-string)))))
+              ;; Following again: the window's point is past what was typed.
+              (spyglass-test-settle 0.1)
+              (should (= (window-point) (with-current-buffer mirror (point-max))))))
+        (spyglass-e2e--kill-comint buffer)))))
+
+(defvar spyglass-e2e--submitted nil
+  "What the stand-in shell submitted, newest first.")
+
+(defvar spyglass-e2e--interrupted nil
+  "Non-nil once the stand-in shell was interrupted.")
+
+(defun spyglass-e2e--shell-submit ()
+  "Submit the stand-in shell's input, as agent-shell's submit does."
+  (interactive)
+  (goto-char (point-max))
+  (let ((input (buffer-substring-no-properties
+                (process-mark (get-buffer-process (current-buffer))) (point-max))))
+    (push input spyglass-e2e--submitted)
+    (insert "\n")
+    (set-marker (process-mark (get-buffer-process (current-buffer))) (point-max))))
+
+(defun spyglass-e2e--shell-interrupt ()
+  "Interrupt the stand-in shell, asking first as agent-shell may."
+  (interactive)
+  (when (y-or-n-p "Interrupt? ")
+    (setq spyglass-e2e--interrupted t)))
+
+(defvar-keymap spyglass-e2e--shell-mode-map
+  :parent comint-mode-map
+  "<remap> <comint-send-input>" #'spyglass-e2e--shell-submit
+  "C-c C-c" #'spyglass-e2e--shell-interrupt)
+
+(define-derived-mode spyglass-e2e--shell-mode comint-mode "Stand-in shell"
+  "A comint buffer submitting as agent-shell does: RET is its own command.
+`comint-send-input' alone only keeps the input, as shell-maker's
+`comint-input-sender' does, the line committed and nothing sent."
+  (setq-local comint-input-sender (lambda (_process _input))))
+
+(ert-deftest spyglass-e2e-key-commands ()
+  "A shell whose RET is its own command submits through it once listed, never otherwise looked up."
+  (skip-unless (executable-find "cat"))
+  (spyglass-test-with-connection connection
+    (let ((buffer (make-comint "spyglass-agent" "cat")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (spyglass-e2e--shell-mode)
+            (set-marker (process-mark (get-buffer-process buffer)) (point-max))
+            (setq spyglass-e2e--submitted nil spyglass-e2e--interrupted nil)
+            (let ((mirror (spyglass-test-mirror connection buffer))
+                  (errors nil))
+              ;; Not listed: comint's own, which submits nothing here.
+              (spyglass-mirror-send-string "first" mirror)
+              (spyglass-mirror-send-key "RET" mirror)
+              (spyglass-test-settle 0.2)
+              (should-not spyglass-e2e--submitted)
+              ;; Listed, as drover lists a front end's: its own submit.
+              (setq-local spyglass-key-commands
+                          '(("RET" . spyglass-e2e--shell-submit) ("C-c" . spyglass-e2e--shell-interrupt)))
+              (spyglass-mirror-send-string "second" mirror)
+              (spyglass-mirror-send-key "RET" mirror)
+              (spyglass-test-wait (lambda () spyglass-e2e--submitted))
+              (should (equal spyglass-e2e--submitted '("second")))
+              ;; A command asking the owner's user fails, never waits.
+              (let ((spyglass-error-functions (list (lambda (_c message) (push message errors)))))
+                (spyglass-mirror-send-key "C-c" mirror)
+                (spyglass-test-wait (lambda () errors) 5))
+              (should-not spyglass-e2e--interrupted)
+              (should errors)
+              (spyglass-test-converge buffer mirror)))
+        (spyglass-e2e--kill-comint buffer)))))
+
 (ert-deftest spyglass-e2e-reconnect-resumes ()
   "A broken stream comes back, and the mirror resumes where it was."
   (spyglass-test-with-connection connection
