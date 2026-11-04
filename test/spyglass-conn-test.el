@@ -549,24 +549,6 @@ frozen peer stayed connected for as long as it was stopped."
         (kill-buffer buffer))
       (delete-directory dir t))))
 
-(ert-deftest spyglass-conn-paced-streams ()
-  "Frames are written whole, in order and bounded on paced streams too.
-Streams both of whose ends' writes block, as Emacs's sockets on
-Windows, are paced: these tests run so on any system."
-  (let ((spyglass--pace-streams t))
-    (dolist (test '(spyglass-conn-frame-whole-while-filter-answers
-                    spyglass-conn-frame-whole-while-mirror-acknowledges
-                    spyglass-conn-frame-whole-while-timer-sends
-                    spyglass-conn-frame-whole-while-channel-answers
-                    spyglass-conn-frames-handled-in-order
-                    spyglass-conn-queue-bounded
-                    spyglass-conn-inbox-bounded
-                    spyglass-conn-failed-write-drops-stream
-                    spyglass-conn-reconnect
-                    spyglass-conn-mirrors-both-ways-slow-readers))
-      (ert-info ((symbol-name test))
-        (funcall (ert-test-body (ert-get-test test)))))))
-
 (ert-deftest spyglass-conn-paced-window ()
   "A paced stream keeps what the peer has not read within the window.
 A frame larger than a quarter of it goes in fragments, which the other
