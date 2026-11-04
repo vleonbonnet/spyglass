@@ -185,7 +185,7 @@ the buffer, else the buffer's point.")
 (defvar-local spyglass-key-commands nil
   "Commands viewers' keys run in this buffer, an alist (KEY . COMMAND).
 KEY is a key as viewers send it, in `key-description' form, such as
-\"RET\" or \"C-c\" (what a mirror's C-c C-c sends); COMMAND a command,
+\"RET\", or control-C as a mirror sends it to interrupt; COMMAND a command,
 run interactively in the buffer at its input, or a function of no
 argument.  Keys are never looked up in the owner's keymaps: an
 application lists here the commands it lets viewers run, as drover lists
@@ -1765,8 +1765,8 @@ Text goes in at the input point (see `spyglass-comint-input-point'),
 which moves past it, as typing there would; keys edit the input there,
 move it, or run what the buffer's `spyglass-key-commands' give them,
 else comint's own commands: RET submits through
-`spyglass-submit-function' or `comint-send-input', C-c interrupts, M-p
-and M-n, and the up and down arrows, recall the input history."
+`spyglass-submit-function' or `comint-send-input', control-C interrupts,
+and the arrows up and down, with their Meta keys, recall the input history."
   (let ((start (spyglass--comint-input-start))
         (point (spyglass-comint-input-point)))
     (if (eq kind 'string)

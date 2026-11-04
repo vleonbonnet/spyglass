@@ -184,6 +184,7 @@ here, through the estimated clock offset)."
   :doc "Keymap of `spyglass-mirror-mode'."
   "<remap> <self-insert-command>" #'spyglass-mirror-self-insert
   "RET" #'spyglass-mirror-forward-key
+  "M-RET" #'spyglass-mirror-forward-key
   "TAB" #'spyglass-mirror-forward-key
   "DEL" #'spyglass-mirror-forward-key
   "<backspace>" #'spyglass-mirror-forward-key

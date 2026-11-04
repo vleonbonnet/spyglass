@@ -41,7 +41,7 @@ The server listens on 127.0.0.1 only and writes its port and a random token to =
 
 ** In a mirror
 
-Printing characters, =RET=, =TAB=, =DEL=, the arrows and =ESC= go to the owner; =C-c C-c=, =C-c C-d=, =C-c C-z= and =C-c C-j= send control characters, =C-c C-q= the next key, =C-c C-s= a string; =C-c C-f= toggles following the owner's cursor; =C-c C-k= closes the mirror. Point in a mirror is yours, to read where you like; the owner's cursor shows where typing goes, the input of a shell, and typing brings point back to it. In a shell, typing and the keys edit the input at that cursor, =RET= submits it. The header line tells where the mirror comes from, whether it is live, reconnecting or closed, and the size of a terminal.
+Printing characters, =RET=, =M-RET=, =TAB=, =DEL=, the arrows and =ESC= go to the owner; =C-c C-c=, =C-c C-d=, =C-c C-z= and =C-c C-j= send control characters, =C-c C-q= the next key, =C-c C-s= a string; =C-c C-f= toggles following the owner's cursor; =C-c C-k= closes the mirror. Point in a mirror is yours, to read where you like; the owner's cursor shows where typing goes, the input of a shell, and typing brings point back to it. In a shell, typing and the keys edit the input at that cursor, =RET= submits it. The header line tells where the mirror comes from, whether it is live, reconnecting or closed, and the size of a terminal.
 
 * API
 
