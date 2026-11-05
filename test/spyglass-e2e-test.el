@@ -681,6 +681,45 @@ see /dev."
             (should-not (buffer-local-value 'face-remapping-alist mirror))
             (should-not (buffer-local-value 'header-line-format mirror))))))))
 
+(ert-deftest spyglass-e2e-reloaded-while-mirrored ()
+  "Spyglass loaded anew, as updating it in a running Emacs does, keeps its shares and mirrors going."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "reloaded"
+      (insert "before\n")
+      (let* ((mirror (spyglass-test-mirror connection (current-buffer)))
+             (shares (length (spyglass-shares))))
+        (dolist (file '("spyglass-wire" "spyglass-conn" "spyglass-channel" "spyglass-owner"
+                        "spyglass-mirror" "spyglass-window" "spyglass"))
+          (load file nil t))
+        (should (= (length (spyglass-shares)) shares))
+        (should (spyglass-share-of (current-buffer)))
+        (should (eq (spyglass-mirror-state mirror) 'live))
+        (goto-char (point-max))
+        (insert "after\n")
+        (spyglass-test-converge (current-buffer) mirror)
+        (spyglass-mirror-send-string "typed" mirror)
+        (spyglass-test-wait (lambda () (string-search "typed" (buffer-string))))
+        (should (string-search "typed" (buffer-string)))))))
+
+(ert-deftest spyglass-e2e-closed-mirror-says-why ()
+  "Typing in a mirror that closed says it is closed, and why, as the application tells it; yanking sends the kill."
+  (spyglass-test-with-connection connection
+    (spyglass-e2e--with-buffer "closing"
+      (insert "text\n")
+      (let ((mirror (spyglass-test-mirror connection (current-buffer)))
+            (kill-ring nil))
+        (kill-new "pasted words")
+        (with-current-buffer mirror (spyglass-mirror-yank))
+        (spyglass-test-wait (lambda () (string-search "pasted words" (buffer-string))))
+        (should (string-search "pasted words" (buffer-string)))
+        (spyglass-unshare (current-buffer))
+        (spyglass-test-wait (lambda () (eq (spyglass-mirror-state mirror) 'closed)))
+        (should (equal (spyglass-mirror-closed-reason mirror) "unshared"))
+        (spyglass-mirror-set-closed-reason mirror "the terminal on its host was closed")
+        (should (string-match-p "closed: the terminal on its host was closed"
+                                (cadr (should-error (spyglass-mirror-send-string "x" mirror)
+                                                    :type 'user-error))))))))
+
 (ert-deftest spyglass-e2e-reconnect-resumes ()
   "A broken stream comes back, and the mirror resumes where it was."
   (spyglass-test-with-connection connection

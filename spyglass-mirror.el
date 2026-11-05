@@ -184,6 +184,7 @@ here, through the estimated clock offset)."
 (defvar-keymap spyglass-mirror-mode-map
   :doc "Keymap of `spyglass-mirror-mode'."
   "<remap> <self-insert-command>" #'spyglass-mirror-self-insert
+  "<remap> <yank>" #'spyglass-mirror-yank
   "RET" #'spyglass-mirror-forward-key
   "M-RET" #'spyglass-mirror-forward-key
   "TAB" #'spyglass-mirror-forward-key
@@ -408,6 +409,16 @@ The buffer stays, showing what it showed."
 (defun spyglass-mirror-owner-point (mirror-or-buffer)
   "Return the owner's cursor in MIRROR-OR-BUFFER, or nil before it is known."
   (spyglass--mirror-point (spyglass--mirror-of mirror-or-buffer)))
+
+(defun spyglass-mirror-set-closed-reason (mirror-or-buffer reason)
+  "Have MIRROR-OR-BUFFER, a mirror that closed, tell REASON, a line, why.
+For an application knowing better than the owner's last word, as that
+the share went because the terminal it showed was closed.  Nothing for a
+mirror not closed."
+  (let ((mirror (spyglass--mirror-of mirror-or-buffer)))
+    (when (eq (spyglass--mirror-state mirror) 'closed)
+      (setf (spyglass--mirror-reason mirror) reason)
+      (force-mode-line-update t))))
 
 (defun spyglass-mirror-closed-reason (mirror-or-buffer)
   "Return why MIRROR-OR-BUFFER closed, or nil while it is not closed."
@@ -934,6 +945,10 @@ window showing it on a visible frame."
         (meta (spyglass--mirror-meta mirror))
         (name (or (gethash mirror spyglass--mirror-titles) (spyglass--mirror-share mirror))))
     (cond
+     ;; Its connection may live on: what is sent would go nowhere.
+     ((eq (spyglass--mirror-state mirror) 'closed)
+      (user-error "Mirror %s is closed%s: it takes no input" name
+                  (if (spyglass--mirror-reason mirror) (concat ": " (spyglass--mirror-reason mirror)) "")))
      ((not (spyglass-connection-live-p connection))
       (user-error "Mirror %s is not connected" name))
      ((eq (plist-get meta :in) :false)
@@ -973,6 +988,15 @@ MIRROR-OR-BUFFER defaults to the current buffer."
   "Send the character typed, N times, to the owner."
   (interactive "p" spyglass-mirror-mode)
   (spyglass-mirror-send-string (make-string n last-command-event)))
+
+(defun spyglass-mirror-yank (&optional arg)
+  "Send the owner the text last killed, as typed: what yanking would insert.
+With ARG, the ARGth most recent kill, as `yank' takes it.  A mirror is
+read-only: yanking sends the text instead of inserting it here."
+  (interactive "P" spyglass-mirror-mode)
+  (spyglass-mirror-send-string
+   (substring-no-properties
+    (current-kill (cond ((listp arg) 0) ((eq arg '-) -2) (t (1- arg)))))))
 
 (defun spyglass-mirror-forward-key ()
   "Send the key typed to the owner."
