@@ -874,6 +874,30 @@ otherwise."
   (when (eq (spyglass-connection-state connection) 'open)
     (spyglass--schedule-heartbeat connection)))
 
+(defvar spyglass--resume-windows (make-hash-table :test #'eq :weakness 'key)
+  "Seconds accepted connections wait for their peer to come back, by connection.")
+
+(defun spyglass-connection-set-resume (connection seconds)
+  "Have CONNECTION, once its stream ends, wait SECONDS for its peer to come back.
+An accepted connection whose stream ended waits for the same peer
+instance to connect again, which adopts its new stream and resumes its
+mirrors, for `spyglass-heartbeat-timeout' seconds by default, then
+closes for good.  A peer that comes and goes, as a phone closing its
+streams when its application leaves the screen, may be given longer, so
+that its mirrors resume rather than start over.  SECONDS nil restores
+the default; otherwise it must be a positive number of seconds, else
+signal an error."
+  (unless (or (null seconds) (and (numberp seconds) (> seconds 0)))
+    (error "Spyglass resume window of %s: %S is not a positive number"
+           (spyglass-connection-label connection) seconds))
+  (if seconds
+      (puthash connection (float seconds) spyglass--resume-windows)
+    (remhash connection spyglass--resume-windows)))
+
+(defun spyglass--resume-window (connection)
+  "Return the seconds CONNECTION waits for its peer once its stream ended."
+  (or (gethash connection spyglass--resume-windows) spyglass-heartbeat-timeout))
+
 (defun spyglass--heartbeat-settings (connection)
   "Return CONNECTION's heartbeat interval and timeout, (INTERVAL . TIMEOUT).
 Seconds, as floats: those `spyglass-connection-set-heartbeat' gave,
@@ -1047,7 +1071,7 @@ Return what it wrote to standard error, trimmed, or nil."
         (spyglass--guard connection (funcall f connection nil)))
       (spyglass--set-state connection 'reconnecting)
       (setf (spyglass-connection-timer connection)
-            (spyglass--run-with-timer spyglass-heartbeat-timeout nil
+            (spyglass--run-with-timer (spyglass--resume-window connection) nil
                                       #'spyglass--expire connection)))
      (t
       (spyglass--close-final connection)))))

@@ -497,6 +497,29 @@ own, from its registration."
                (with-current-buffer (process-buffer process) (buffer-string))))
       (cons process pid))))
 
+(ert-deftest spyglass-conn-resume-window ()
+  "An accepted connection waits for its peer as long as it was given, then closes.
+A phone closes its streams as its application leaves the screen, and
+comes back minutes later: its connections are given longer than the
+default, so that its mirrors resume rather than start over."
+  (spyglass-conn-test--with (client server)
+    (dolist (bad '(0 -1 "5" t))
+      (ert-info ((format "%S" bad))
+        (should-error (spyglass-connection-set-resume server bad))))
+    (should (eql (spyglass--resume-window server) spyglass-heartbeat-timeout))
+    (spyglass-connection-set-resume server 0.5)
+    (should (eql (spyglass--resume-window server) 0.5))
+    (let ((spyglass-reconnect-delays '(5)))
+      (spyglass-connection-drop-stream client))
+    (spyglass-test-wait (lambda () (eq (spyglass-connection-state server) 'reconnecting)) 5)
+    (should (eq (spyglass-connection-state server) 'reconnecting))
+    (let ((start (float-time)))
+      (spyglass-test-wait (lambda () (eq (spyglass-connection-state server) 'closed)) 5)
+      (should (eq (spyglass-connection-state server) 'closed))
+      (should (< (- (float-time) start) 3)))
+    (spyglass-connection-set-resume server nil)
+    (should (eql (spyglass--resume-window server) spyglass-heartbeat-timeout))))
+
 (ert-deftest spyglass-conn-heartbeat-drops-frozen-peer ()
   "A peer stopped by SIGSTOP is dropped within the timeout, given in integers.
 Its stream stays open to the system: only heartbeats tell.  With
