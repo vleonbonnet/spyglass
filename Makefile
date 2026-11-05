@@ -52,6 +52,7 @@ SELECTOR ?=
 # returned.  Never start one otherwise.
 GUI_EMACS ?= $(EMACS)
 GUI = test/gui-emacs.sh -t $(TIMEOUT) $(GUI_EMACS)
+# The tests of test-gui to run, a regexp; empty for every GUI test.
 GUI_SELECTOR ?=
 
 .PHONY: all compile test-compile test test-one test-gui lint bench lag lag-gui clean

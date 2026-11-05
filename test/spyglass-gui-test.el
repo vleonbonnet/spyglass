@@ -548,7 +548,12 @@ Each step of waiting redisplays, as the command loop would: window
 change functions, Ghostel's among them, run then."
   (spyglass-bench-start-guard)
   (advice-add 'spyglass-test-step :before #'redisplay)
-  (let* ((stats (ert-run-tests-batch (or (getenv "SPYGLASS_GUI_SELECTOR") "spyglass-gui-")))
+  (let* ((selector (getenv "SPYGLASS_GUI_SELECTOR"))
+         ;; make passes an empty selector by default, which would match
+         ;; every test loaded, the transport tests required above too.
+         (stats (ert-run-tests-batch (if (member selector '(nil ""))
+                                         "\\`spyglass-gui-"
+                                       selector)))
          (failed (ert-stats-completed-unexpected stats)))
     (with-current-buffer (messages-buffer)
       (let ((coding-system-for-write 'utf-8))
