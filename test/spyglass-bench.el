@@ -575,7 +575,11 @@ Both ends send at once; return the measurements of both."
 
 (defun spyglass-bench--print-table (rows)
   "Print ROWS as an Org table."
-  (let* ((rows (cons spyglass-bench--header rows))
+  (spyglass-bench--print-table-of spyglass-bench--header rows))
+
+(defun spyglass-bench--print-table-of (header rows)
+  "Print ROWS under HEADER as an Org table."
+  (let* ((rows (cons header rows))
          (widths (apply #'cl-mapcar (lambda (&rest cells) (apply #'max (mapcar #'length cells)))
                         rows)))
     (cl-flet ((line (cells)

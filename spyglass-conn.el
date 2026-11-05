@@ -90,6 +90,17 @@ value it has when the stream is made."
   :group 'spyglass
   :type 'natnum)
 
+(defcustom spyglass-w32-pipe-size (* 4 1024 1024)
+  "Bytes of the pipes between Emacs on Windows and SSH, for its streams.
+A write a pipe cannot take makes Emacs wait 20 ms or more before trying
+again (`send_process'), so that what a stream carries is bounded by
+what its pipe holds; Windows's pipes hold 4 KB unless asked for more
+\(`w32-pipe-buffer-size').  Channels keep what they send and the peer
+has not acknowledged below it.  Applies to the streams of
+`spyglass-ssh-transport' started after it is set."
+  :group 'spyglass
+  :type 'natnum)
+
 (defvar spyglass--pace-streams nil
   "Non-nil makes every stream made meanwhile write as on Windows, paced.
 For tests: pacing is otherwise for streams whose writes block.")
@@ -436,6 +447,26 @@ So Emacs writes to sockets on Windows."
   (or spyglass--pace-streams
       (and (eq system-type 'windows-nt)
            (eq (process-type process) 'network))))
+
+(defconst spyglass--pipe-capacity (* 64 1024)
+  "Bytes a pipe holds elsewhere than on Windows: 64 KB on macOS and Linux.")
+
+(defvar w32-pipe-buffer-size)
+
+(defun spyglass--write-capacity (process)
+  "Return the bytes PROCESS takes before a write to it waits, or nil.
+Nil when it takes many: a socket, whose buffers the system sizes to
+the traffic.  A pipe holds `spyglass--pipe-capacity', or on Windows
+what it was made with (see `spyglass-w32-pipe-size'); a write it
+cannot take makes Emacs wait 20 ms or more before trying again.  So
+channels keep the bytes in flight below it (see spyglass-channel.el)."
+  (when (eq (process-type process) 'real)
+    (if (eq system-type 'windows-nt)
+        (or (process-get process 'spyglass-pipe-size)
+            (and (natnump w32-pipe-buffer-size) (> w32-pipe-buffer-size 0)
+                 w32-pipe-buffer-size)
+            4096)
+      spyglass--pipe-capacity)))
 
 (defun spyglass--put (process pace string)
   "Write STRING, part of a frame, on PROCESS, counting it in PACE."
@@ -1657,14 +1688,18 @@ and nil; or with nil and a message, at the latest after
 ARGS are extra options for PROGRAM."
   (let ((sink (spyglass--stderr-sink (format "spyglass-%s" host))))
     (condition-case err
-        (let ((stream (spyglass--spawn
-                       :name (format "spyglass-%s" host)
-                       :command (append (list program) args
-                                        (list "-o" "BatchMode=yes" "-W"
-                                              (format "127.0.0.1:%d" port) host))
-                       :coding 'binary :noquery t :connection-type 'pipe
-                       :filter #'ignore :sentinel #'ignore :stderr sink)))
+        (let* ((size spyglass-w32-pipe-size)
+               (stream (let ((w32-pipe-buffer-size size))
+                         (spyglass--spawn
+                          :name (format "spyglass-%s" host)
+                          :command (append (list program) args
+                                           (list "-o" "BatchMode=yes" "-W"
+                                                 (format "127.0.0.1:%d" port) host))
+                          :coding 'binary :noquery t :connection-type 'pipe
+                          :filter #'ignore :sentinel #'ignore :stderr sink))))
           (process-put stream 'spyglass-stderr sink)
+          (when (eq system-type 'windows-nt)
+            (process-put stream 'spyglass-pipe-size (if (> size 0) size 4096)))
           (funcall done stream token))
       (error (spyglass--discard-sink sink)
              (funcall done nil (error-message-string err))))))

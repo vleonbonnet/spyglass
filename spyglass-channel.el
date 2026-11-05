@@ -34,7 +34,10 @@
 ;; A message larger than `spyglass-channel-chunk-size' bytes goes in
 ;; chunks, at most `spyglass-channel-window' bytes of them sent and not
 ;; acknowledged, from timers giving way to the command loop, and is
-;; reassembled before its handler sees it; none may exceed
+;; reassembled before its handler sees it; on a stream whose end here is
+;; a pipe, as SSH's, the window is what the pipe holds, in chunks of a
+;; quarter of it, since a write the pipe cannot take makes Emacs wait
+;; 20 ms (`spyglass--write-capacity').  None may exceed
 ;; `spyglass-channel-max-size'.  Messages of a connection arrive in the
 ;; order sent, while its stream lives: those not sent when it breaks
 ;; are dropped, and so are those half received.  Applications resume
@@ -56,10 +59,17 @@
   :group 'spyglass
   :type 'natnum)
 
-(defcustom spyglass-channel-window (* 1024 1024)
-  "Bytes of chunks sent on a connection and not acknowledged, at most."
+(defcustom spyglass-channel-window (* 2 1024 1024)
+  "Bytes of chunks sent on a connection and not acknowledged, at most.
+On a stream whose end here is a pipe, at most what the pipe holds (see
+`spyglass--write-capacity'), and chunks at most a quarter of that."
   :group 'spyglass
   :type 'natnum)
+
+(defconst spyglass-channel--min-chunk 4096
+  "Smallest chunk sent to peers announcing the capability \"ck\", in bytes.
+Unless `spyglass-channel-chunk-size' is smaller.  Receivers bound the
+chunks a message is announced in by it.")
 
 (defcustom spyglass-channel-tick-budget 0.004
   "Seconds a timer sending queued messages runs before giving way."
@@ -178,6 +188,24 @@ Messages and bytes sent and received, chunks, messages queued now."
 
 ;;;; Encoding
 
+(defun spyglass--channel-sizes (connection)
+  "Return the window and the chunk size of CONNECTION's channels, a cons.
+`spyglass-channel-window' and `spyglass-channel-chunk-size'; for a peer
+announcing \"ck\", the window at most what this end of the stream takes
+before a write waits (`spyglass--write-capacity'), and chunks at most a
+quarter of the window, so that the pipe to SSH never fills: a write it
+cannot take waits 20 ms or more.  Through SSH's pipe on a Mac, channels
+carried 2.4 MB/s to Windows so filling it, and 23 MB/s not (see
+doc/design.org)."
+  (let* ((process (spyglass-connection-process connection))
+         (capacity (and process (spyglass-connection-capable-p connection "ck")
+                        (spyglass--write-capacity process))))
+    (if (not capacity)
+        (cons spyglass-channel-window spyglass-channel-chunk-size)
+      (let ((window (max spyglass-channel--min-chunk (min spyglass-channel-window capacity))))
+        (cons window (min spyglass-channel-chunk-size
+                          (max spyglass-channel--min-chunk (/ window 4))))))))
+
 (defun spyglass--channel-clean (value depth)
   "Return VALUE with its strings made such as JSON carries them.
 Objects (plists and alists) and arrays are walked DEPTH levels deep."
@@ -258,6 +286,7 @@ window's reach."
       (spyglass--channel-schedule connection 0.001))
      (t
       (let ((deadline (+ (float-time) spyglass-channel-tick-budget))
+            (window (car (spyglass--channel-sizes connection)))
             (first t))
         (catch 'stop
           (while (spyglass--link-control link)
@@ -267,7 +296,7 @@ window's reach."
           (while (spyglass--link-head link)
             (pcase-let ((`(,frame ,size ,ack) (car (spyglass--link-head link))))
               (when (and ack (> (spyglass--link-inflight link) 0)
-                         (> (+ (spyglass--link-inflight link) size) spyglass-channel-window))
+                         (> (+ (spyglass--link-inflight link) size) window))
                 ;; An acknowledgment sends the rest.
                 (throw 'stop nil))
               (when (and (not first) (> (float-time) deadline))
@@ -295,19 +324,19 @@ window's reach."
             (append (spyglass--link-control link) (list (spyglass-wire-frame header))))
       (spyglass--channel-pump connection))))
 
-(defun spyglass--channel-frames (channel extra bytes link)
+(defun spyglass--channel-frames (channel extra bytes link chunk)
   "Return the frames of a message of CHANNEL, BYTES of JSON, as queue items.
 EXTRA is a plist of routing members every frame carries.  LINK numbers
-chunked messages."
+chunked messages; CHUNK is their size."
   (let ((size (length bytes)))
-    (if (<= size spyglass-channel-chunk-size)
+    (if (<= size chunk)
         (list (list (spyglass-wire-frame (spyglass--channel-header channel extra) bytes) size nil))
       (let* ((id (cl-incf (spyglass--link-next-id link)))
-             (count (ceiling size (float spyglass-channel-chunk-size)))
+             (count (ceiling size (float chunk)))
              (items nil))
         (dotimes (n count)
-          (let* ((start (* n spyglass-channel-chunk-size))
-                 (piece (substring bytes start (min size (+ start spyglass-channel-chunk-size)))))
+          (let* ((start (* n chunk))
+                 (piece (substring bytes start (min size (+ start chunk)))))
             (push (list (spyglass-wire-frame
                          (spyglass--channel-header channel (append (list :k id :n n :of count) extra))
                          piece)
@@ -328,7 +357,9 @@ Return non-nil when sent or queued."
    (t
     (let ((link (spyglass--link connection)))
       (spyglass--link-count link :messages-out)
-      (spyglass--channel-enqueue connection (spyglass--channel-frames channel extra bytes link))
+      (spyglass--channel-enqueue connection
+                                 (spyglass--channel-frames channel extra bytes link
+                                                           (cdr (spyglass--channel-sizes connection))))
       t))))
 
 (defun spyglass-channel-send (connection channel message)
@@ -469,7 +500,8 @@ open, its peer has no channels or the message is too large."
         (spyglass--link-count link :chunks-in)
         (cond
          ((not (and (natnump id) (natnump n) (natnump count) (< n count)
-                    (<= (* (1- count) spyglass-channel-chunk-size) spyglass-channel-max-size)))
+                    (<= (* (1- count) (min spyglass-channel--min-chunk spyglass-channel-chunk-size))
+                        spyglass-channel-max-size)))
           (spyglass--report connection "Malformed chunk on channel %s"
                             (spyglass-wire-plain-string (format "%s" (plist-get header :ch)))))
          (t

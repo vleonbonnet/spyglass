@@ -89,11 +89,13 @@
         (message "%s" msg)
         (kill-emacs 3)))))
 
-(defun spyglass-bench-start-guard ()
-  "Watch this Emacs's memory every 100 ms."
-  (unless spyglass-bench--guard-timer
-    (setq spyglass-bench--guard-timer
-          (run-with-timer 0.1 0.1 #'spyglass-bench--check-memory))))
+(defun spyglass-bench-start-guard (&optional interval)
+  "Watch this Emacs's memory every INTERVAL seconds, 0.1 by default.
+Started again when running, at the new interval."
+  (when spyglass-bench--guard-timer
+    (cancel-timer spyglass-bench--guard-timer))
+  (setq spyglass-bench--guard-timer
+        (run-with-timer (or interval 0.1) (or interval 0.1) #'spyglass-bench--check-memory)))
 
 (defun spyglass-bench-reset-peak ()
   "Start measuring the peak of resident memory afresh."
@@ -804,6 +806,164 @@ message's text in order."
   (spyglass-unregister-channel "bench")
   (setq spyglass-bench--channel nil)
   (garbage-collect))
+
+;;;; Transfers
+
+;; A transfer is a clone's: the receiver asks the sender for the pieces
+;; of a payload on the channel "xfer", PIECE bytes a request, FLIGHT
+;; requests awaiting their answers at once, each answered in base64, as
+;; drover's clones are.  The payload is the same on both ends, read
+;; from a block of pseudo-random bytes at offsets of its own, so that
+;; the receiver checks every byte of every piece where it lands.  A
+;; timer every 10 ms measures how late the receiver runs its timers
+;; meanwhile; the memory guard looks every 500 ms instead of 100, since
+;; reading the resident memory takes 8 ms on Windows.
+
+(defvar spyglass-bench-channel-sizes nil
+  "Nil, or the window and chunk size of every channel, a cons, for sweeps.
+They replace those `spyglass--channel-sizes' chooses.")
+
+(advice-add 'spyglass--channel-sizes :before-until
+            (lambda (&rest _) spyglass-bench-channel-sizes)
+            '((name . spyglass-bench-channel-sizes)))
+
+(defconst spyglass-bench--xfer-modulus 1048573
+  "Bytes after which the payload of a transfer repeats, a prime.")
+
+(defconst spyglass-bench--xfer-max-piece (* 1024 1024)
+  "Largest piece of a transfer.")
+
+(defvar spyglass-bench--xfer-block nil
+  "Pseudo-random bytes the payloads of transfers are read from.")
+
+(defun spyglass-bench--xfer-bytes (offset count)
+  "Return COUNT bytes of a transfer's payload from OFFSET, a unibyte string."
+  (unless spyglass-bench--xfer-block
+    (let ((parts nil)
+          (size (+ spyglass-bench--xfer-modulus spyglass-bench--xfer-max-piece)))
+      (dotimes (i (1+ (/ size 32)))
+        (push (secure-hash 'sha256 (format "spyglass %d" i) nil nil t) parts))
+      (setq spyglass-bench--xfer-block (apply #'concat (nreverse parts)))))
+  (let ((start (% offset spyglass-bench--xfer-modulus)))
+    (substring spyglass-bench--xfer-block start (+ start count))))
+
+(defun spyglass-bench-xfer-serve ()
+  "Answer the pieces of transfers asked on the channel \"xfer\"."
+  (spyglass-register-channel
+   "xfer" #'ignore
+   :request (lambda (_connection message reply)
+              (let ((offset (plist-get message :o))
+                    (count (plist-get message :n)))
+                (if (and (natnump offset) (natnump count)
+                         (<= count spyglass-bench--xfer-max-piece))
+                    (funcall reply (list :d (base64-encode-string
+                                             (spyglass-bench--xfer-bytes offset count) t)))
+                  (funcall reply nil "no such piece"))))))
+
+(defvar spyglass-bench--probe nil
+  "The probe of timers' lateness: a plist of :timer, :due and :lates.")
+
+(defun spyglass-bench--probe-tick ()
+  "Note how late the probe's timer ran, and arm it again."
+  (when spyglass-bench--probe
+    (let ((now (float-time)))
+      (plist-put spyglass-bench--probe :lates
+                 (cons (- now (plist-get spyglass-bench--probe :due))
+                       (plist-get spyglass-bench--probe :lates)))
+      (plist-put spyglass-bench--probe :due (+ now 0.01))
+      (plist-put spyglass-bench--probe :timer
+                 (run-with-timer 0.01 nil #'spyglass-bench--probe-tick)))))
+
+(defun spyglass-bench-probe-start ()
+  "Start measuring how late a timer every 10 ms runs."
+  (spyglass-bench-probe-stop)
+  (setq spyglass-bench--probe (list :due (+ (float-time) 0.01) :lates nil
+                                    :timer (run-with-timer 0.01 nil #'spyglass-bench--probe-tick))))
+
+(defun spyglass-bench-probe-stop ()
+  "Stop the probe; return its lateness: :p50, :p95, :p99 and :max, in seconds."
+  (when spyglass-bench--probe
+    (let ((probe spyglass-bench--probe))
+      (setq spyglass-bench--probe nil)
+      (cancel-timer (plist-get probe :timer))
+      (let* ((sorted (sort (plist-get probe :lates) #'<))
+             (n (length sorted)))
+        (cl-flet ((at (q) (if sorted (nth (min (1- n) (floor (* q n))) sorted) 0)))
+          (list :n n :p50 (at 0.5) :p95 (at 0.95) :p99 (at 0.99)
+                :max (if sorted (car (last sorted)) 0)))))))
+
+(defun spyglass-bench-xfer-receive (connection args callback)
+  "Take from CONNECTION's peer a transfer ARGS describes; then call CALLBACK.
+ARGS has :total, the payload's bytes, :piece and :flight, and
+:read-max, `read-process-output-max' meanwhile, if non-nil.  CALLBACK
+gets a plist: the seconds taken, the bytes received, whether every
+piece was the payload's, the error that ended it if any, the timers'
+lateness, the processor time and the peak of resident memory."
+  (let* ((total (plist-get args :total))
+         (piece (min spyglass-bench--xfer-max-piece (plist-get args :piece)))
+         (flight (plist-get args :flight))
+         (read-max (plist-get args :read-max))
+         (saved read-process-output-max)
+         (state (list :next 0 :received 0 :flight 0 :exact t :error nil :done nil))
+         (start nil) (cpu nil) (gc nil))
+    (spyglass-bench--xfer-bytes 0 1)
+    (when read-max (setq read-process-output-max read-max))
+    (spyglass-bench-start-guard 0.5)
+    (garbage-collect)
+    (spyglass-bench-reset-peak)
+    (let ((rss (spyglass-bench-rss)))
+      (cl-labels
+          ((finish (error)
+             (unless (plist-get state :done)
+               (plist-put state :done t)
+               (setq read-process-output-max saved)
+               (spyglass-bench-start-guard)
+               (let ((elapsed (- (float-time) start))
+                     (late (spyglass-bench-probe-stop))
+                     (gcs (spyglass-bench-gc)))
+                 (funcall callback
+                          (list :time elapsed :bytes (plist-get state :received)
+                                :exact (if (and (plist-get state :exact) (null error)
+                                                (= (plist-get state :received) total))
+                                           t :false)
+                                :error (or error :false)
+                                :late late :cpu (- (spyglass-bench-cpu) cpu)
+                                :gcs (- (car gcs) (car gc)) :gc-time (- (cdr gcs) (cdr gc))
+                                :rss rss :rss-peak spyglass-bench--rss-peak)))))
+           (pump ()
+             (while (and (not (plist-get state :done))
+                         (< (plist-get state :flight) flight)
+                         (< (plist-get state :next) total))
+               (let* ((offset (plist-get state :next))
+                      (count (min piece (- total offset))))
+                 (plist-put state :next (+ offset count))
+                 (plist-put state :flight (1+ (plist-get state :flight)))
+                 (spyglass-channel-request
+                  connection "xfer" (list :o offset :n count)
+                  (lambda (reply error)
+                    (arrived offset count reply error))
+                  120))))
+           (arrived (offset count reply error)
+             (unless (plist-get state :done)
+               (plist-put state :flight (1- (plist-get state :flight)))
+               (let ((bytes (and (null error) (stringp (plist-get reply :d))
+                                 (ignore-errors (base64-decode-string (plist-get reply :d))))))
+                 (cond
+                  (error (finish error))
+                  ((null bytes) (finish "a piece did not decode"))
+                  (t
+                   (unless (and (= (length bytes) count)
+                                (string= bytes (spyglass-bench--xfer-bytes offset count)))
+                     (plist-put state :exact nil))
+                   (plist-put state :received (+ (plist-get state :received) (length bytes)))
+                   (if (>= (plist-get state :received) total)
+                       (finish nil)
+                     (pump))))))))
+        (setq start (float-time)
+              cpu (spyglass-bench-cpu)
+              gc (spyglass-bench-gc))
+        (spyglass-bench-probe-start)
+        (pump)))))
 
 (provide 'spyglass-bench-common)
 ;;; spyglass-bench-common.el ends here

@@ -24,6 +24,19 @@ BENCH_SSH ?= ssh
 BENCH_REMOTE_EMACS ?= emacs
 BENCH_ONLY ?=
 BENCH_WINDOW ?=
+XFER_DIRS ?=
+XFER_PATHS ?=
+XFER_SIZES ?=
+XFER_WINDOWS ?=
+XFER_CHUNKS ?=
+XFER_READ_MAX ?=
+XFER_PIPE ?=
+XFER_PIECE ?=
+XFER_FLIGHT ?=
+XFER_REPS ?=
+XFER_BACK_SSH ?=
+XFER_BACK_ARGS ?=
+XFER_BACK_HOST ?=
 LAG_SSH ?= ssh
 LAG_SSH_HOST ?=
 
@@ -55,7 +68,7 @@ GUI = test/gui-emacs.sh -t $(TIMEOUT) $(GUI_EMACS)
 # The tests of test-gui to run, a regexp; empty for every GUI test.
 GUI_SELECTOR ?=
 
-.PHONY: all compile test-compile test test-one test-gui lint bench lag lag-gui clean
+.PHONY: all compile test-compile test test-one test-gui lint bench transfer lag lag-gui clean
 
 all: compile test
 
@@ -163,6 +176,21 @@ bench: compile
 	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" SPYGLASS_BENCH_ONLY="$(BENCH_ONLY)" \
 	SPYGLASS_BENCH_WINDOW="$(BENCH_WINDOW)" \
 	$(EMACS_BATCH) -l test/spyglass-bench.el -f spyglass-bench-main
+
+# Not part of test: the benchmark's agent takes payloads from this
+# Emacs as drover's clones do, over a sweep of windows, chunks and
+# reads, through 127.0.0.1 or through SSH to BENCH_REMOTE, both ways
+# of dialing (XFER_PATHS).  See test/spyglass-transfer.el.
+transfer: compile
+	$(NOPIPE) SPYGLASS_EMACS="$(EMACS)" SPYGLASS_TIMEOUT="$(TIMEOUT)" \
+	SPYGLASS_BENCH_REMOTE="$(BENCH_REMOTE)" SPYGLASS_BENCH_SSH="$(BENCH_SSH)" \
+	SPYGLASS_BENCH_REMOTE_EMACS="$(BENCH_REMOTE_EMACS)" \
+	XFER_DIRS="$(XFER_DIRS)" XFER_PATHS="$(XFER_PATHS)" XFER_SIZES="$(XFER_SIZES)" XFER_WINDOWS="$(XFER_WINDOWS)" \
+	XFER_CHUNKS="$(XFER_CHUNKS)" XFER_READ_MAX="$(XFER_READ_MAX)" XFER_PIPE="$(XFER_PIPE)" \
+	XFER_PIECE="$(XFER_PIECE)" XFER_FLIGHT="$(XFER_FLIGHT)" XFER_REPS="$(XFER_REPS)" \
+	XFER_BACK_SSH="$(XFER_BACK_SSH)" XFER_BACK_ARGS="$(XFER_BACK_ARGS)" \
+	XFER_BACK_HOST="$(XFER_BACK_HOST)" \
+	$(EMACS_BATCH) -l test/spyglass-transfer.el -f spyglass-transfer-main
 
 # Not part of test: how long attempts to connect, failing or not, keep
 # Emacs from running timers.  See test/spyglass-lag.el.

@@ -33,6 +33,9 @@
 (defvar spyglass-bench-agent--last-command (float-time)
   "When the last command came.")
 
+(defvar spyglass-bench-agent--dialed nil
+  "The connection this agent dialed to the driver, or nil.")
+
 (defun spyglass-bench-agent--say (plist)
   "Tell the driver PLIST, a line on standard error."
   (message "SPYBENCH %s" (json-serialize plist :null-object nil :false-object :false)))
@@ -92,6 +95,48 @@
           ("chan-cleanup"
            (spyglass-bench-channel-cleanup)
            (spyglass-bench-agent--say (list :id id :result (list :rss (spyglass-bench-rss)))))
+          ("dial"
+           ;; The pipes to SSH are sized as the stream is made.
+           (when spyglass-bench-agent--dialed
+             (spyglass-disconnect spyglass-bench-agent--dialed)
+             (setq spyglass-bench-agent--dialed nil))
+           (when (plist-get args :pipe)
+             (setq spyglass-w32-pipe-size (plist-get args :pipe)))
+           (let ((connection (spyglass-connect
+                              (spyglass-ssh-transport (plist-get args :host)
+                                                      :program (plist-get args :program)
+                                                      :args (append (plist-get args :args) nil)
+                                                      :file (plist-get args :file))
+                              :name "driver")))
+             (setq spyglass-bench-agent--dialed connection)
+             (spyglass-bench-wait (lambda () (spyglass-connection-live-p connection)) 60)
+             (spyglass-bench-agent--say
+              (list :id id :result (list :live (if (spyglass-connection-live-p connection) t :false))))))
+          ("xfer"
+           (let ((connection (if (plist-get args :dialed)
+                                 spyglass-bench-agent--dialed
+                               (car (last (spyglass-connections))))))
+             (spyglass-bench-xfer-receive
+              connection args
+              (lambda (result) (spyglass-bench-agent--say (list :id id :result result))))))
+          ("knobs"
+           (setq spyglass-bench-channel-sizes
+                 (and (plist-get args :window)
+                      (cons (plist-get args :window) (plist-get args :chunk))))
+           (spyglass-bench-agent--say (list :id id :result (list :ok t))))
+          ("probe-start"
+           (spyglass-bench-start-guard 0.5)
+           (spyglass-bench-probe-start)
+           (spyglass-bench-agent--say (list :id id :result (list :ok t))))
+          ("probe-stop"
+           (spyglass-bench-start-guard)
+           (spyglass-bench-agent--say (list :id id :result (spyglass-bench-probe-stop))))
+          ("idle"
+           (spyglass-bench-start-guard 0.5)
+           (spyglass-bench-probe-start)
+           (spyglass-bench-wait (lambda () nil) (plist-get args :seconds))
+           (spyglass-bench-start-guard)
+           (spyglass-bench-agent--say (list :id id :result (spyglass-bench-probe-stop))))
           ("cleanup"
            (spyglass-bench-chatter nil nil)
            (spyglass-bench-owner-cleanup)
@@ -123,6 +168,7 @@ timer: scenarios wait for events, which waiting there would distort."
   (add-hook 'spyglass-error-functions
             (lambda (_c msg) (spyglass-bench-agent--say (list :warning msg))))
   (spyglass-bench-start-guard)
+  (spyglass-bench-xfer-serve)
   (let ((server (spyglass-server-start :file (expand-file-name "server.json"))))
     (with-current-buffer (get-buffer-create "control")
       (spyglass-share (current-buffer) :input #'spyglass-bench-agent--input))

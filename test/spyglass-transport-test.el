@@ -387,5 +387,48 @@ POSIX shell and nc."
                 (should (< lag spyglass-transport-test-max-lag))))
           (kill-buffer buffer))))))
 
+(ert-deftest spyglass-transport-ssh-channels-fit-the-pipe ()
+  "Channels keep in flight what the pipe to ssh holds, in chunks of a quarter.
+A write the pipe cannot take would wait 20 ms.  The other end, a
+socket, keeps the configured window; a peer not announcing small
+chunks gets the configured sizes."
+  (spyglass-transport-test-with-ssh (ssh)
+    (spyglass-transport-test-with ((spyglass-reconnect-delays '(0.2)))
+      (spyglass-test-start)
+      (let* ((received nil)
+             (connection (spyglass-connect (spyglass-ssh-transport "peer" :program ssh
+                                                                   :file spyglass-test--server-file)
+                                           :name "peer"))
+             (big (make-string (* 3 1024 1024) ?p))
+             (peak 0)
+             (watch nil))
+        (spyglass-register-channel "pipe" (lambda (_c m) (push m received)))
+        (unwind-protect
+            (progn
+              (spyglass-test-wait (lambda () (spyglass-connection-live-p connection)))
+              (should (spyglass-connection-live-p connection))
+              (should (eq (process-type (spyglass-connection-process connection)) 'real))
+              (should (equal (spyglass--channel-sizes connection) (cons (* 64 1024) (* 16 1024))))
+              (let ((other (spyglass-test-other-end connection)))
+                (should (equal (spyglass--channel-sizes other)
+                               (cons spyglass-channel-window spyglass-channel-chunk-size))))
+              (setq watch (run-at-time 0 0.001
+                                       (lambda ()
+                                         (setq peak (max peak (plist-get (spyglass-channel-stats connection)
+                                                                         :inflight))))))
+              (should (spyglass-channel-send connection "pipe" (list :s big)))
+              (spyglass-test-wait (lambda () received) 30)
+              (should (equal (plist-get (car received) :s) big))
+              (should (<= peak (* 64 1024)))
+              ;; Far more chunks than peers predating "ck" accept.
+              (should (>= (plist-get (spyglass-channel-stats connection) :chunks-out) 192))
+              (setf (spyglass-connection-peer-caps connection)
+                    (remove "ck" (spyglass-connection-peer-caps connection)))
+              (should (equal (spyglass--channel-sizes connection)
+                             (cons spyglass-channel-window spyglass-channel-chunk-size)))
+              (should-not spyglass-test-errors))
+          (when watch (cancel-timer watch))
+          (spyglass-unregister-channel "pipe"))))))
+
 (provide 'spyglass-transport-test)
 ;;; spyglass-transport-test.el ends here
