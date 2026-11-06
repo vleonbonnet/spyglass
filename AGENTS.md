@@ -13,8 +13,8 @@ Emacs Lisp library mirroring live buffers between two Emacs instances, on one ho
 
 You may evaluate code in the user's running Emacs through Anvil, to inspect state or to try a change; follow `~/.emacs.d/AGENTS.md` (no buffers displayed, no prompts).
 
-- This Mac: once main is pushed, `(val/elpaca/update-packages 'spyglass :rebuild t)` with `emacs-eval-async`. `~/local/projects/spyglass` is another clone: `git pull --ff-only` it too.
-- Core, the Windows host: `myssh core "/ucrt64/bin/emacsclient -f ~/.emacs.d/server/server --eval \"(val/elpaca/update-packages 'spyglass)\""`.
+- This Mac installs spyglass from this checkout. After merging to main: `(val/elpaca/update-packages 'spyglass :rebuild t)` with `emacs-eval-async`.
+- Core, the Windows host, installs it from GitHub: once main is pushed, `myssh core "/ucrt64/bin/emacsclient -f ~/.emacs.d/server/server --eval \"(val/elpaca/update-packages 'spyglass)\""`.
 - Both run in the background. The outcome, or the failure: `(list (car (gethash (val/elpaca/package-key 'spyglass) val/elpaca/stories)) (val/maintenance/failure 'update (val/elpaca/package-key 'spyglass)))`.
 
 ## Boundaries
@@ -36,4 +36,4 @@ You may evaluate code in the user's running Emacs through Anvil, to inspect stat
 
 ## Finishing
 
-Commit messages: an imperative subject, then prose paragraphs saying what changed and why. Run `make compile lint test`, push main, then update spyglass on this Mac and on Core as above.
+Commit messages: an imperative subject, then prose paragraphs saying what changed and why. Merge onto the local main, run `make compile lint test` there, push main, then update spyglass on this Mac and on Core as above.
