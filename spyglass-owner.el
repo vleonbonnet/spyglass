@@ -1009,16 +1009,16 @@ off; polling captures again later."
                          buffer-invisibility-spec)))
     t))
 
-(defconst spyglass--mode-line-limit 500
-  "Characters at most of the owner's mode line or header line sent to viewers.")
+(defconst spyglass--header-line-limit 500
+  "Characters at most of the owner's header line sent to viewers.")
 
 (defconst spyglass--remap-limit 32
   "Faces at most of the owner's buffer's remapping sent to viewers.")
 
 (defun spyglass--render-window ()
-  "Return a window showing the current buffer, to render its mode line in, or nil.
-An owner's window, else its parking window: a mode line rendered without
-one shows the selected window's buffer in its parts reading it."
+  "Return a window showing this buffer, to render its header line in, or nil.
+An owner's window, else its parking window: a header line rendered
+without one shows the selected window's buffer in its parts reading it."
   (let ((windows (get-buffer-window-list (current-buffer) nil t)))
     (or (cl-find-if-not (lambda (window) (frame-parameter (window-frame window) 'spyglass-parking))
                         windows)
@@ -1026,7 +1026,7 @@ one shows the selected window's buffer in its parts reading it."
 
 (defun spyglass--render-line (format window)
   "Return FORMAT, a mode line construct, rendered in WINDOW for this buffer.
-Sanitized, bounded to `spyglass--mode-line-limit' characters; nil when
+Sanitized, bounded to `spyglass--header-line-limit' characters; nil when
 empty or it cannot be."
   (when format
     (let ((line (condition-case nil
@@ -1034,8 +1034,8 @@ empty or it cannot be."
                   (error nil))))
       (when (and line (not (string-blank-p line)))
         (spyglass-wire-sanitize-string
-         (if (> (length line) spyglass--mode-line-limit)
-             (substring line 0 spyglass--mode-line-limit)
+         (if (> (length line) spyglass--header-line-limit)
+             (substring line 0 spyglass--header-line-limit)
            line))))))
 
 (defun spyglass--face-remapping ()
@@ -1053,17 +1053,15 @@ A vector of [FACE SPECS], each face's remapping sanitized, at most
 
 (defun spyglass--compute-meta (share)
   "Return the description of SHARE's buffer sent to viewers.
-Its mode line and header line are rendered in a window showing the
-buffer, its mode line only then (see `spyglass--render-window'); the
-faces they and the remapping name are noted for viewers lacking them."
+Its header line is rendered in a window showing the buffer, if any (see
+`spyglass--render-window'); the faces it and the remapping name are
+noted for viewers lacking them.  Viewers draw a mode line of their own."
   (let* ((window (spyglass--render-window))
          (header (spyglass--render-line header-line-format window))
-         (mode-line (and window (spyglass--render-line mode-line-format window)))
          (remap (spyglass--face-remapping)))
     (puthash share (plist-put (gethash share spyglass--share-options) :meta-faces
                               (delete-dups
                                (append (spyglass-wire-face-names header)
-                                       (spyglass-wire-face-names mode-line)
                                        (mapcan (lambda (entry)
                                                  (spyglass--face-names (cons (car entry) (cdr entry))))
                                                (seq-take face-remapping-alist spyglass--remap-limit)))))
@@ -1076,7 +1074,6 @@ faces they and the remapping name are noted for viewers lacking them."
            :ww (if word-wrap t :false)
            :inv (spyglass--invisibility-spec)
            :hl (if header (spyglass-wire-encode header) :false)
-           :ml (if mode-line (spyglass-wire-encode mode-line) :false)
            :fr (or remap :false)
            :fl (if (spyglass-share-jit share) t :false)
            ;; A function decides per viewer: see `spyglass--meta-for'.
