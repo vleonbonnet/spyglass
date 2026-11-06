@@ -73,31 +73,31 @@
 (ert-deftest spyglass-gui-mirror-draws-its-own-mode-line ()
   "A mirror's mode line is this Emacs's, its state after the mode; its header line the owner's, rendered in the owner's window."
   (spyglass-test-with-connection connection
-                                 (let ((buffer (generate-new-buffer "owner-lines"))
-                                       (config (current-window-configuration)))
-                                   (unwind-protect
-                                       (progn
-                                         (with-current-buffer buffer
-                                           (insert "text\n")
-                                           (setq-local mode-line-format '("OWNER " (:eval (buffer-name)) " %b"))
-                                           (setq-local header-line-format '("HEADER " (:eval (buffer-name)))))
-                                         (set-window-buffer (selected-window) buffer)
-                                         (let ((mirror (spyglass-test-mirror connection buffer)))
-                                           ;; The selected window shows the mirror, the owner's another.
-                                           (set-window-buffer (split-window) mirror)
-                                           (select-window (get-buffer-window mirror))
-                                           (spyglass-test-wait (lambda () (with-current-buffer mirror
-                                                                            (string-search "[live]" (format-mode-line mode-line-format)))))
-                                           (with-current-buffer mirror
-                                             (let ((line (format-mode-line mode-line-format)))
-                                               (should-not (string-search "OWNER" line))
-                                               (should (string-search (buffer-name mirror) line))
-                                               (should (string-match-p "Spyglass:Fundamental owner-lines@self \\[live\\]" line)))
-                                             (should (equal (format-mode-line header-line-format) "HEADER owner-lines")))
-                                           (kill-buffer mirror)))
-                                     (set-window-configuration config)
-                                     (delete-other-windows)
-                                     (kill-buffer buffer)))))
+    (let ((buffer (generate-new-buffer "owner-lines"))
+          (config (current-window-configuration)))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (insert "text\n")
+              (setq-local mode-line-format '("OWNER " (:eval (buffer-name)) " %b"))
+              (setq-local header-line-format '("HEADER " (:eval (buffer-name)))))
+            (set-window-buffer (selected-window) buffer)
+            (let ((mirror (spyglass-test-mirror connection buffer)))
+              ;; The selected window shows the mirror, the owner's another.
+              (set-window-buffer (split-window) mirror)
+              (select-window (get-buffer-window mirror))
+              (spyglass-test-wait (lambda () (with-current-buffer mirror
+                                               (string-search "[live]" (format-mode-line mode-line-format)))))
+              (with-current-buffer mirror
+                (let ((line (format-mode-line mode-line-format)))
+                  (should-not (string-search "OWNER" line))
+                  (should (string-search (buffer-name mirror) line))
+                  (should (string-match-p "Spyglass:Fundamental owner-lines@self \\[live\\]" line)))
+                (should (equal (format-mode-line header-line-format) "HEADER owner-lines")))
+              (kill-buffer mirror)))
+        (set-window-configuration config)
+        (delete-other-windows)
+        (kill-buffer buffer)))))
 
 (ert-deftest spyglass-gui-parks-and-releases ()
   "A buffer needing a window is parked while viewers watch it and no window shows it."

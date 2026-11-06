@@ -272,12 +272,15 @@ and why, the terminal's size, and whether input is refused."
 (defun spyglass--mirror-mode-line-process ()
   "Return what a mirror's mode line tells of it, as a mode line construct.
 What `spyglass-mirror-mode-line-function' gives, then, compactly, where
-the mirror comes from and its state."
+the mirror comes from and its state; each part spaced from what is
+before it, whatever spaces the application put around its own."
   (when-let* ((mirror spyglass--mirror))
-    (let ((application (and spyglass-mirror-mode-line-function
-                            (condition-case nil (funcall spyglass-mirror-mode-line-function)
-                              (error nil)))))
-      (string-replace "%" "%%" (concat (and (stringp application) application)
+    (let* ((application (and spyglass-mirror-mode-line-function
+                             (condition-case nil (funcall spyglass-mirror-mode-line-function)
+                               (error nil))))
+           (application (and (stringp application) (string-trim application))))
+      (string-replace "%" "%%" (concat (and application (not (string-empty-p application))
+                                            (concat " " application))
                                        (spyglass--mirror-state-line mirror))))))
 
 ;; Mirrors an older spyglass opened, kept by loading this one, drew a
