@@ -928,6 +928,32 @@ answer has the other half to come before TIMEOUT; a silent peer is
 dropped within that after TIMEOUT."
   (/ (min interval (- timeout interval)) 2.0))
 
+;; The connection's structure keeps its layout in an Emacs running an
+;; older spyglass: what the heartbeat counts is kept by connection.
+(defvar spyglass--absences (make-hash-table :test #'eq :weakness 'key)
+  "How long this Emacs could not hear each connection's peer, by connection.
+A list (LOOKED HEARD ABSENT): when the heartbeat last looked at the
+connection, its `last-recv' then, and the seconds since then that this
+Emacs was kept from looking at it (see `spyglass--unheard').")
+
+(defun spyglass--unheard (connection now period)
+  "Return the seconds CONNECTION's peer was silent while this Emacs could hear it.
+That is the time since the peer was last heard, less the time this
+Emacs was kept meanwhile from looking at the connection, every PERIOD
+seconds: a look later than that, as after this Emacs was busy or not
+given the processor, tells how long it read nothing either.  A peer
+answering meanwhile is not silent: its frames wait unread, and Emacs
+runs late timers before reading them, a repeating one several times in
+a row.  NOW is the time of this look, recorded for the next."
+  (let* ((heard (spyglass-connection-last-recv connection))
+         (absence (gethash connection spyglass--absences))
+         (absent (if (eql (nth 1 absence) heard) (nth 2 absence) 0.0)))
+    (when-let* ((looked (car absence)))
+      ;; Not longer than since the peer was heard: before, it was heard.
+      (setq absent (+ absent (min (max 0.0 (- now looked period)) (max 0.0 (- now heard))))))
+    (puthash connection (list now heard absent) spyglass--absences)
+    (- now heard absent)))
+
 (defun spyglass--schedule-heartbeat (connection)
   "Check CONNECTION's liveness every few seconds."
   (spyglass--cancel-timer connection)
@@ -941,11 +967,15 @@ dropped within that after TIMEOUT."
       (spyglass--report connection "Heartbeat of %s: %s; using %gs and %gs"
                         (spyglass-connection-label connection) problem
                         (car settings) (cdr settings)))
+    (puthash connection (list (float-time) (spyglass-connection-last-recv connection) 0.0)
+             spyglass--absences)
     (setf (spyglass-connection-timer connection)
           (spyglass--run-with-timer period period #'spyglass--heartbeat connection))))
 
 (defun spyglass--heartbeat (connection)
-  "Send a heartbeat on CONNECTION, or drop it when the peer went silent."
+  "Send a heartbeat on CONNECTION, or drop it when the peer went silent.
+Silent while this Emacs could hear it: time this Emacs was kept from
+reading does not count (see `spyglass--unheard')."
   (spyglass--guard connection
     (let* ((now (float-time))
            (settings (spyglass--heartbeat-settings connection))
@@ -954,7 +984,7 @@ dropped within that after TIMEOUT."
       (cond
        ((not (eq (spyglass-connection-state connection) 'open))
         (spyglass--cancel-timer connection))
-       ((> (- now (spyglass-connection-last-recv connection)) timeout)
+       ((> (spyglass--unheard connection now (spyglass--heartbeat-period interval timeout)) timeout)
         (spyglass--report connection "No word from %s for %gs"
                           (spyglass-connection-label connection) timeout)
         (spyglass--drop connection))

@@ -572,6 +572,38 @@ frozen peer stayed connected for as long as it was stopped."
         (kill-buffer buffer))
       (delete-directory dir t))))
 
+(ert-deftest spyglass-conn-heartbeat-outlasts-a-stall ()
+  "This Emacs kept busy past the timeout drops no peer, which a silent one still is.
+The peer's answers waited unread, and Emacs ran the late heartbeat
+before reading them, several times in a row: a peer that kept
+answering was dropped as silent.  Only the silence this Emacs could
+hear counts; a peer whose stream reads nothing while this Emacs
+listens is dropped within the timeout."
+  (spyglass-conn-test--with (client server)
+    (spyglass-connection-set-heartbeat client 0.5 2)
+    (spyglass-connection-set-heartbeat server 0.5 2)
+    (spyglass-test-settle 0.75)
+    ;; Busy, reading nothing and running no timer, past the timeout.
+    (let ((end (+ (float-time) 2.5)))
+      (while (< (float-time) end)))
+    (spyglass-test-settle 1.5)
+    (should (spyglass-connection-live-p client))
+    (should (spyglass-connection-live-p server))
+    (should-not (seq-some (lambda (m) (string-match-p "No word" m)) spyglass-test-errors))
+    ;; The server's end stops reading: its pings and answers stop.  How
+    ;; soon it is dropped, `spyglass-conn-heartbeat-drops-frozen-peer'
+    ;; tells: a bound of time here would fail whenever the processor is
+    ;; busy, its time not counted.
+    (let ((stream (spyglass-connection-process server)))
+      (stop-process stream)
+      (unwind-protect
+          (progn
+            (spyglass-test-wait (lambda () (not (spyglass-connection-live-p client))) 20)
+            (should-not (spyglass-connection-live-p client)))
+        (when (process-live-p stream)
+          (continue-process stream))))
+    (should (seq-some (lambda (m) (string-match-p "No word from .* for 2s" m)) spyglass-test-errors))))
+
 (ert-deftest spyglass-conn-paced-window ()
   "A paced stream keeps what the peer has not read within the window.
 A frame larger than a quarter of it goes in fragments, which the other
