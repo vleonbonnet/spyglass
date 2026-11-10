@@ -936,7 +936,7 @@ A list (LOOKED HEARD ABSENT): when the heartbeat last looked at the
 connection, its `last-recv' then, and the seconds since then that this
 Emacs was kept from looking at it (see `spyglass--unheard').")
 
-(defun spyglass--unheard (connection now period)
+(defun spyglass--unheard (connection now period &optional peek)
   "Return the seconds CONNECTION's peer was silent while this Emacs could hear it.
 That is the time since the peer was last heard, less the time this
 Emacs was kept meanwhile from looking at the connection, every PERIOD
@@ -944,15 +944,29 @@ seconds: a look later than that, as after this Emacs was busy or not
 given the processor, tells how long it read nothing either.  A peer
 answering meanwhile is not silent: its frames wait unread, and Emacs
 runs late timers before reading them, a repeating one several times in
-a row.  NOW is the time of this look, recorded for the next."
+a row.  NOW is the time of this look, recorded for the next unless
+PEEK, for a look that is not the heartbeat's."
   (let* ((heard (spyglass-connection-last-recv connection))
          (absence (gethash connection spyglass--absences))
          (absent (if (eql (nth 1 absence) heard) (nth 2 absence) 0.0)))
     (when-let* ((looked (car absence)))
       ;; Not longer than since the peer was heard: before, it was heard.
       (setq absent (+ absent (min (max 0.0 (- now looked period)) (max 0.0 (- now heard))))))
-    (puthash connection (list now heard absent) spyglass--absences)
+    (unless peek
+      (puthash connection (list now heard absent) spyglass--absences))
     (- now heard absent)))
+
+(defun spyglass-connection-silence (connection)
+  "Return how long CONNECTION's peer was silent while this Emacs could hear it.
+In seconds: the time since the peer was last heard, less the time this
+Emacs was kept meanwhile from reading, the stretch it may be kept now
+included, as the heartbeat counts it before dropping a peer silent past
+its timeout (see `spyglass--unheard').  An application waiting for a
+peer judges it so, not by its own lateness: right after a long command,
+the peer's answers still wait unread."
+  (let ((settings (spyglass--heartbeat-settings connection)))
+    (spyglass--unheard connection (float-time)
+                       (spyglass--heartbeat-period (car settings) (cdr settings)) t)))
 
 (defun spyglass--schedule-heartbeat (connection)
   "Check CONNECTION's liveness every few seconds."

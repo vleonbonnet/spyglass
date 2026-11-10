@@ -577,8 +577,9 @@ frozen peer stayed connected for as long as it was stopped."
 The peer's answers waited unread, and Emacs ran the late heartbeat
 before reading them, several times in a row: a peer that kept
 answering was dropped as silent.  Only the silence this Emacs could
-hear counts; a peer whose stream reads nothing while this Emacs
-listens is dropped within the timeout."
+hear counts, as `spyglass-connection-silence' tells applications; a
+peer whose stream reads nothing while this Emacs listens is dropped
+within the timeout."
   (spyglass-conn-test--with (client server)
     (spyglass-connection-set-heartbeat client 0.5 2)
     (spyglass-connection-set-heartbeat server 0.5 2)
@@ -586,6 +587,10 @@ listens is dropped within the timeout."
     ;; Busy, reading nothing and running no timer, past the timeout.
     (let ((end (+ (float-time) 2.5)))
       (while (< (float-time) end)))
+    ;; Nothing read yet: the peer was heard long ago, but silent only
+    ;; while this Emacs could hear it, before it was kept.
+    (should (> (- (float-time) (spyglass-connection-last-recv client)) 2.5))
+    (should (< (spyglass-connection-silence client) 1.5))
     (spyglass-test-settle 1.5)
     (should (spyglass-connection-live-p client))
     (should (spyglass-connection-live-p server))
