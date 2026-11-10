@@ -124,8 +124,11 @@ keep_times() {
     esac
   done
   [ ${#bases[@]} -gt 0 ] || return 0
-  # The times kept first, then this run's, which replace them.
-  awk -v directory="$times" '
+  # The times kept first, then this run's, which replace them.  The
+  # directory comes through the environment: awk -v reads the
+  # backslashes of a Windows path, such as TEMP's, as escapes.
+  TIMES="$times" awk '
+    BEGIN { directory = ENVIRON["TIMES"] }
     NF == 2 {
       base = FILENAME
       sub(/^.*\//, "", base)
