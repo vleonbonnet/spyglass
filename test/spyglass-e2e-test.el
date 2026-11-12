@@ -246,6 +246,56 @@ see /dev."
           (spyglass-notify (current-buffer) 3000 3010))
         (spyglass-test-converge (current-buffer) mirror)))))
 
+(ert-deftest spyglass-e2e-poll-survives-a-throw ()
+  "Changes without hooks still reach the mirror after a `throw' left a poll.
+Emacs runs a repeating timer again only once its function returned: a
+`with-timeout' firing in a wait the poll made left it never to run
+again, and a terminal whose renders went untold stopped reaching its
+viewers."
+  (let ((stage (list nil)))
+    (cl-flet ((poll (_share) (spyglass-test-wait-in-timer stage)))
+      (add-hook 'spyglass--poll-functions #'poll)
+      (unwind-protect
+          (spyglass-test-with-connection connection
+                                         (spyglass-e2e--with-buffer "thrown"
+                                           (insert "before\n")
+                                           (let ((mirror (spyglass-test-mirror connection (current-buffer))))
+                                             (setcar stage 'armed)
+                                             (should (eq (spyglass-test-throw-through stage) 'waiting))
+                                             (let ((inhibit-modification-hooks t))
+                                               (goto-char (point-max))
+                                               (insert "after, without hooks\n"))
+                                             (spyglass-test-converge (current-buffer) mirror 5))))
+        (remove-hook 'spyglass--poll-functions #'poll)))))
+
+(ert-deftest spyglass-e2e-loading-restarts-an-older-poll ()
+  "Loading spyglass again restarts a poll an older one started, stuck or not.
+Its timer called `spyglass--poll' directly: a running Emacs whose poll
+a `throw' had left, as Core's had for hours, found its changes again
+once it loaded this spyglass."
+  (let ((stage (list nil)))
+    (cl-flet ((poll (_share) (spyglass-test-wait-in-timer stage)))
+      (add-hook 'spyglass--poll-functions #'poll)
+      (unwind-protect
+          (spyglass-test-with-connection connection
+                                         (spyglass-e2e--with-buffer "older"
+                                           (insert "before\n")
+                                           (let ((mirror (spyglass-test-mirror connection (current-buffer))))
+                                             ;; The poll as an older spyglass started it.
+                                             (cancel-timer spyglass--poll-timer)
+                                             (setq spyglass--poll-timer
+                                                   (run-with-timer spyglass-poll-interval spyglass-poll-interval
+                                                                   #'spyglass--poll))
+                                             (setcar stage 'armed)
+                                             (should (eq (spyglass-test-throw-through stage) 'waiting))
+                                             (load "spyglass-owner" nil t)
+                                             (should (eq (timer--function spyglass--poll-timer) #'spyglass--run-repeating))
+                                             (let ((inhibit-modification-hooks t))
+                                               (goto-char (point-max))
+                                               (insert "after, without hooks\n"))
+                                             (spyglass-test-converge (current-buffer) mirror 5))))
+        (remove-hook 'spyglass--poll-functions #'poll)))))
+
 (defun spyglass-e2e--random-edit (silent)
   "Make one random edit in the current buffer, without hooks if SILENT."
   (let ((inhibit-modification-hooks silent)

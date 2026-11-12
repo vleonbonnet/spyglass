@@ -174,11 +174,43 @@ its connections."
   (when-let* ((object (spyglass--deref ref)))
     (funcall function object)))
 
+(defun spyglass--run-repeating (function &rest args)
+  "Call FUNCTION with ARGS for a repeating timer, keeping the timer armed.
+`timer-event-handler' marks a repeating timer triggered while its
+function runs and clears the mark once the function returned; Emacs
+runs no timer so marked.  A timer whose function is left otherwise, by
+a `throw' or a quit, stays marked for good: a `with-timeout' or
+`while-no-input' around a wait the function ran within, firing during a
+wait of the function's own, kept it from ever running again.  Such an
+exit arms the timer anew, as a return does.  Repeating timers of
+spyglass run their function through this one."
+  (let ((timer timer-event-last) (done nil))
+    (unwind-protect
+        (prog1 (apply function args) (setq done t))
+      (unless done (spyglass--rearm timer function args)))))
+
+(defun spyglass--rearm (timer function args)
+  "Arm TIMER again, if it is the repeating timer calling FUNCTION with ARGS.
+It is armed while its function runs, but marked triggered: armed
+anew, unmarked, it runs again at its next time.  Nothing when it was
+cancelled meanwhile, or is another: FUNCTION not called by a timer."
+  (when (and (timerp timer) (memq timer timer-list)
+             (eq (timer--function timer) #'spyglass--run-repeating)
+             (eq (car (timer--args timer)) function)
+             (equal (cdr (timer--args timer)) args))
+    (cancel-timer timer)
+    (timer-activate timer)))
+
 (defun spyglass--run-with-timer (delay repeat function object)
   "Call FUNCTION with OBJECT after DELAY seconds, then every REPEAT if non-nil.
 Return the timer, which holds OBJECT through a reference (see
-`spyglass--ref'), so that printing the timer prints a name."
-  (run-with-timer delay repeat #'spyglass--run-referenced function (spyglass--ref object)))
+`spyglass--ref'), so that printing the timer prints a name.  A
+repeating one stays armed whatever ends FUNCTION (see
+`spyglass--run-repeating')."
+  (if repeat
+      (run-with-timer delay repeat #'spyglass--run-repeating
+                      #'spyglass--run-referenced function (spyglass--ref object))
+    (run-with-timer delay nil #'spyglass--run-referenced function (spyglass--ref object))))
 
 (cl-defstruct (spyglass-connection (:constructor spyglass--make-connection)
                                    (:copier nil))
@@ -1771,6 +1803,16 @@ ARGS are extra options for PROGRAM."
           (funcall done stream token))
       (error (spyglass--discard-sink sink)
              (funcall done nil (error-message-string err))))))
+
+;; Heartbeats an older spyglass armed, kept by loading this one, call
+;; their function directly: one a `throw' left would never run again.
+(dolist (connection spyglass--connections)
+  (let ((timer (spyglass-connection-timer connection)))
+    (when (and (timerp timer)
+               (eq (timer--function timer) #'spyglass--run-referenced)
+               (eq (car (timer--args timer)) #'spyglass--heartbeat)
+               (eq (spyglass-connection-state connection) 'open))
+      (spyglass--schedule-heartbeat connection))))
 
 (provide 'spyglass-conn)
 ;;; spyglass-conn.el ends here

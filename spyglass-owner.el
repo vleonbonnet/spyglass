@@ -1451,11 +1451,12 @@ just captured."
 ;;;; Polling
 
 (defun spyglass--start-poll ()
-  "Start polling subscribed shares, unless already."
+  "Start polling subscribed shares, unless already.
+The timer stays armed whatever ends a poll (see `spyglass--run-repeating')."
   (unless spyglass--poll-timer
     (setq spyglass--poll-timer
           (run-with-timer spyglass-poll-interval spyglass-poll-interval
-                          #'spyglass--poll))))
+                          #'spyglass--run-repeating #'spyglass--poll))))
 
 (defun spyglass--poll ()
   "Look for changes made without hooks, sweep, and expire orphans."
@@ -2006,6 +2007,15 @@ Its viewers' mirrors close."
 (defun spyglass-share-viewers (share)
   "Return the keys of SHARE's subscriptions, connected or waiting."
   (mapcar #'spyglass--sub-key (spyglass-share-subs share)))
+
+;; A poll timer an older spyglass started, kept by loading this one,
+;; calls `spyglass--poll' directly: one a `throw' left never runs again,
+;; and the buffers it polls stop reaching their viewers.
+(when (and (timerp spyglass--poll-timer)
+           (not (eq (timer--function spyglass--poll-timer) #'spyglass--run-repeating)))
+  (cancel-timer spyglass--poll-timer)
+  (setq spyglass--poll-timer nil)
+  (spyglass--start-poll))
 
 (provide 'spyglass-owner)
 ;;; spyglass-owner.el ends here

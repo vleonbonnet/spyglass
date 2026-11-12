@@ -84,6 +84,29 @@ as a timer, sentinel or filter not returning, makes it wait."
           (cons value (max 0.0 (- worst spyglass-test-lag-period))))
       (cancel-timer timer))))
 
+(defun spyglass-test-wait-in-timer (stage)
+  "Wait a second when STAGE, a cons, holds `armed', as a timer's function.
+STAGE then holds `waiting' while it waits, and `returned' once it
+returned, which a throw out of the wait never lets happen: see
+`spyglass-test-throw-through'."
+  (when (eq (car stage) 'armed)
+    (setcar stage 'waiting)
+    (let ((end (+ (float-time) 1)))
+      (while (< (float-time) end) (accept-process-output nil 0.05)))
+    (setcar stage 'returned)))
+
+(defun spyglass-test-throw-through (stage)
+  "Throw out of a timer's function waiting, as a `with-timeout' around does.
+STAGE, a cons, holds `armed': a timer's function calling
+`spyglass-test-wait-in-timer' with it waits a second.  Meanwhile this
+waits in a `with-timeout' of 0.2 s, as Anvil's evaluations and
+`while-no-input' wait around the timers Emacs runs; its timer fires in
+the function's wait, and throws out of it.  Return what STAGE holds
+then, `waiting' when the throw went through the function."
+  (with-timeout (0.2 nil)
+    (while t (accept-process-output nil 0.01)))
+  (car stage))
+
 (defun spyglass-test-runs (buffer &optional owner)
   "Return BUFFER's text and mirrored properties as a list of runs.
 Each run is (TEXT . PROPS), PROPS sanitized as a mirror keeps them.

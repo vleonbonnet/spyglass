@@ -609,6 +609,46 @@ within the timeout."
           (continue-process stream))))
     (should (seq-some (lambda (m) (string-match-p "No word from .* for 2s" m)) spyglass-test-errors))))
 
+(ert-deftest spyglass-conn-heartbeat-survives-a-throw ()
+  "A heartbeat left by a `throw' runs again.
+Emacs runs a repeating timer again only once its function returned: a
+`with-timeout' firing in a wait the heartbeat made, while it pinged, say,
+left it never to run again, the peer neither pinged nor dropped."
+  (let ((stage (list nil)) (looks 0))
+    (cl-flet ((look (&rest _)
+                (cl-incf looks)
+                (spyglass-test-wait-in-timer stage)))
+      (advice-add 'spyglass--heartbeat :before #'look)
+      (unwind-protect
+          (spyglass-conn-test--with (client server)
+            (spyglass-connection-set-heartbeat client 0.2 0.8)
+            (setcar stage 'armed)
+            (should (eq (spyglass-test-throw-through stage) 'waiting))
+            (let ((before looks))
+              (spyglass-test-wait (lambda () (> looks (+ before 3))) 5)
+              (should (> looks (+ before 3))))
+            (should (spyglass-connection-live-p client)))
+        (advice-remove 'spyglass--heartbeat #'look)))))
+
+(ert-deftest spyglass-conn-loading-restarts-older-heartbeats ()
+  "Loading spyglass again restarts heartbeats an older one armed.
+Their timers called their function directly: one a `throw' had left
+never ran again, until this spyglass was loaded."
+  (spyglass-conn-test--with (client server)
+    (spyglass-connection-set-heartbeat client 0.2 0.8)
+    ;; The heartbeat as an older spyglass armed it.
+    (spyglass--cancel-timer client)
+    (setf (spyglass-connection-timer client)
+          (run-with-timer 0.1 0.1 #'spyglass--run-referenced
+                          #'spyglass--heartbeat (spyglass--ref client)))
+    (load "spyglass-conn" nil t)
+    (let ((timer (spyglass-connection-timer client)))
+      (should (eq (timer--function timer) #'spyglass--run-repeating))
+      (should (memq timer timer-list))
+      (should (eql (timer--repeat-delay timer) 0.1)))
+    (spyglass-test-settle 0.5)
+    (should (spyglass-connection-live-p client))))
+
 (ert-deftest spyglass-conn-paced-window ()
   "A paced stream keeps what the peer has not read within the window.
 A frame larger than a quarter of it goes in fragments, which the other

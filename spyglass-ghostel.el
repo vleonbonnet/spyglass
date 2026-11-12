@@ -21,8 +21,11 @@
 ;; `inhibit-modification-hooks' bound, then publishes the range it
 ;; rewrote in `ghostel--repainted-region'.  After each render this
 ;; adapter passes that range to `spyglass-notify'; scrollback trimmed
-;; at the top shows as a deletion anyway.  Viewers follow the
-;; terminal's cursor and type through Ghostel's key encoder.
+;; at the top shows as a deletion anyway.  The renderer is a function
+;; of Ghostel's native module, which may load after this adapter and
+;; defines it with `fset', dropping advice: the adapter advises it again
+;; whenever it finds the advice gone.  Viewers follow the terminal's
+;; cursor and type through Ghostel's key encoder.
 ;;
 ;; Ghostel renders only buffers shown in a window: the adapter marks
 ;; its buffers as needing one, so that spyglass parks a shared
@@ -59,6 +62,28 @@
         (if (consp region)
             (spyglass-notify (current-buffer) (car region) (cdr region))
           (spyglass-notify (current-buffer) (point-max) (point-max)))))))
+
+(defun spyglass-ghostel--advise ()
+  "Advise `ghostel--redraw' with `spyglass-ghostel--after-redraw', unless it is.
+The renderer comes from Ghostel's native module, which defines its
+functions with `fset' when it loads, as late as the first terminal made
+when the module was missing or stale as Ghostel loaded: advice added
+before is kept pending, for a `defalias' that never comes, and advice
+added after is lost when the module is loaded again.  Renders then went
+untold, their changes found only by polling."
+  (when (and (fboundp 'ghostel--redraw)
+             (not (advice-function-member-p #'spyglass-ghostel--after-redraw
+                                            (symbol-function 'ghostel--redraw))))
+    ;; Removing it drops the pending advice, which would otherwise
+    ;; stand for the function's.
+    (advice-remove 'ghostel--redraw #'spyglass-ghostel--after-redraw)
+    (advice-add 'ghostel--redraw :after #'spyglass-ghostel--after-redraw)))
+
+(defun spyglass-ghostel--poll (_share)
+  "Keep Ghostel's renders told to spyglass while a terminal is watched.
+Called in the buffer of each watched share."
+  (when (derived-mode-p 'ghostel-mode)
+    (spyglass-ghostel--advise)))
 
 (defun spyglass-ghostel--point ()
   "Return the terminal's cursor."
@@ -101,6 +126,8 @@ through."
   "Set the input, cursor, size and window needs of a Ghostel SHARE."
   (with-current-buffer (spyglass-share-buffer share)
     (when (derived-mode-p 'ghostel-mode)
+      ;; A terminal means the module is loaded, perhaps since this was.
+      (spyglass-ghostel--advise)
       (setq-local spyglass-input-function #'spyglass-ghostel--input
                   spyglass-point-function #'spyglass-ghostel--point
                   spyglass-needs-window t
@@ -108,13 +135,18 @@ through."
                   spyglass-refit-function #'spyglass-ghostel--refit
                   spyglass-terminal-size-function #'spyglass-ghostel--size))))
 
+;; Pending until the module defines the renderer, if it has not yet;
+;; `spyglass-ghostel--advise' installs it then.
 (advice-add 'ghostel--redraw :after #'spyglass-ghostel--after-redraw)
+(spyglass-ghostel--advise)
 (add-hook 'spyglass-share-functions #'spyglass-ghostel--setup)
+(add-hook 'spyglass--poll-functions #'spyglass-ghostel--poll)
 
 (defun spyglass-ghostel-unload-function ()
   "Remove the advice and hooks of spyglass-ghostel."
   (advice-remove 'ghostel--redraw #'spyglass-ghostel--after-redraw)
   (remove-hook 'spyglass-share-functions #'spyglass-ghostel--setup)
+  (remove-hook 'spyglass--poll-functions #'spyglass-ghostel--poll)
   nil)
 
 (provide 'spyglass-ghostel)
