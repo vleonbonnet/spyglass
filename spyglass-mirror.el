@@ -543,7 +543,7 @@ The attributes come from MIRROR's owner."
         (spyglass--mirror-stat mirror :duplicates))
        ((/= seq (1+ (spyglass--mirror-seq mirror)))
         (spyglass--mirror-start-over mirror (format "update %d missing"
-                                                (1+ (spyglass--mirror-seq mirror)))))
+                                                    (1+ (spyglass--mirror-seq mirror)))))
        (t (spyglass--mirror-apply-or-resync mirror header payload))))))
 
 (defun spyglass--mirror-apply-or-resync (mirror header payload)
@@ -597,18 +597,19 @@ Updates are ignored until the snapshot comes."
       (when (and (vectorp def) (= (length def) 2) (natnump (aref def 0)))
         (puthash (aref def 0) (spyglass--mirror-style mirror (aref def 1)) styles)))
     (with-current-buffer (spyglass--mirror-buffer mirror)
-      (let ((inhibit-read-only t))
+      (let ((inhibit-read-only t)
+            (deactivate-mark nil)
+            (following (spyglass--mirror-following mirror)))
         (save-restriction
           (widen)
-          (save-excursion
-            (seq-doseq (op (or (plist-get header :ops) []))
-              (setq offset (spyglass--mirror-apply-op op text offset styles)))
-            (spyglass--mirror-apply-overlays mirror header styles)))
+          (seq-doseq (op (or (plist-get header :ops) []))
+            (setq offset (spyglass--mirror-apply-op op text offset styles)))
+          (spyglass--mirror-apply-overlays mirror header styles))
         (when-let* ((meta (plist-get header :meta)))
           (spyglass--mirror-apply-meta mirror meta))
         (let ((pt (plist-get header :pt)) (ws (plist-get header :ws)))
           (when (natnump ws) (setf (spyglass--mirror-window-start mirror) ws))
-          (when (natnump pt) (spyglass--mirror-apply-point mirror pt)))))
+          (when (natnump pt) (spyglass--mirror-apply-point mirror pt following)))))
     (setf (spyglass--mirror-seq mirror) (plist-get header :seq))
     (unless (eq (spyglass--mirror-state mirror) 'live)
       (spyglass--mirror-set-state mirror 'live))
@@ -643,10 +644,42 @@ the next op's text.  Malformed ops signal `spyglass-wire-error'."
                 (when props (set-text-properties pos (+ pos run) props string))))
             (setq pos (+ pos run))))
         (setq i (+ i 2)))
-      (goto-char beg)
-      (delete-region beg (+ beg old))
-      (insert string))
+      (spyglass--mirror-replace beg old string))
     (+ offset len)))
+
+(defun spyglass--mirror-replace (beg old string)
+  "Replace OLD characters at BEG with STRING, preserving reading positions.
+Diff text for at most 10 ms.  If the diff times out, keep positions at
+their relative offsets in the replacement, clamped to its end.
+Properties are replaced separately, including on unchanged text."
+  (let* ((len (length string))
+         (same (and (= old len)
+                    (string= string (buffer-substring-no-properties beg (+ beg old)))))
+         (positions (and (not same) (> old 0) (> len 0)
+                         (list (point) (mark t)
+                               (mapcar (lambda (w) (list w (window-point w) (window-start w)))
+                                       (get-buffer-window-list (current-buffer) nil t)))))
+         (preserved t))
+    (unless same
+      (save-excursion
+        (cond
+         ((zerop old) (goto-char beg) (insert string))
+         ((zerop len) (delete-region beg (+ beg old)))
+         (t (setq preserved (replace-region-contents beg (+ beg old) (lambda () string) 0.01))))))
+    (unless preserved
+      (cl-labels ((mapped (pos)
+                    (cond ((< pos beg) pos)
+                          ((>= pos (+ beg old)) (+ pos (- len old)))
+                          (t (+ beg (min (- pos beg) len))))))
+        (goto-char (mapped (car positions)))
+        (when (cadr positions) (set-marker (mark-marker) (mapped (cadr positions))))
+        (pcase-dolist (`(,window ,point ,start) (caddr positions))
+          (set-window-point window (mapped point))
+          (set-window-start window (mapped start) t))))
+    (set-text-properties beg (+ beg len) nil)
+    (dolist (interval (object-intervals string))
+      (when (caddr interval)
+        (set-text-properties (+ beg (car interval)) (+ beg (cadr interval)) (caddr interval))))))
 
 (defun spyglass--mirror-apply-overlays (mirror header styles)
   "Apply the overlays of update HEADER to MIRROR, styled from STYLES."
@@ -744,18 +777,31 @@ own remapping, which a text scale here keeps."
                                          new))
                spyglass--mirror-lines))))
 
-(defun spyglass--mirror-apply-point (mirror pt)
-  "Show the owner's cursor of MIRROR at PT, and follow it in windows there."
-  (let* ((old (spyglass--mirror-point mirror))
-         (pt (max (point-min) (min pt (point-max)))))
+(defun spyglass--mirror-following (mirror)
+  "Return the buffer and windows following MIRROR before an update.
+The car says whether the buffer's point follows; the cdr lists windows.
+An active region keeps its selection instead of following."
+  (let ((old (spyglass--mirror-point mirror))
+        (region (use-region-p)))
+    (if spyglass-mirror-follow
+        (cons (and (not region) (or (null old) (eql (point) old)))
+              (cl-remove-if-not
+               (lambda (w) (and (not (and region (eq w (selected-window))))
+                                (or (null old) (eql (window-point w) old)
+                                    (= (window-point w) (point-max)))))
+               (get-buffer-window-list (current-buffer) nil t)))
+      (list nil))))
+
+(defun spyglass--mirror-apply-point (mirror pt &optional following)
+  "Show MIRROR's owner cursor at PT, following where FOLLOWING says.
+FOLLOWING is the pre-update value of `spyglass--mirror-following', or
+nil to determine it now."
+  (let ((following (or following (spyglass--mirror-following mirror)))
+        (pt (max (point-min) (min pt (point-max)))))
     (setf (spyglass--mirror-point mirror) pt)
-    (when spyglass-mirror-follow
-      (dolist (window (get-buffer-window-list (current-buffer) nil t))
-        (when (or (null old) (eql (window-point window) old)
-                  (= (window-point window) (point-max)))
-          (set-window-point window pt)))
-      (when (or (null old) (eql (point) old))
-        (goto-char pt)))
+    (dolist (window (cdr following))
+      (set-window-point window pt))
+    (when (car following) (goto-char pt))
     (when spyglass-mirror-show-cursor
       (let ((cursor (or (spyglass--mirror-cursor mirror)
                         (let ((ov (make-overlay 1 1)))

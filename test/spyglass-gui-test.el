@@ -28,6 +28,7 @@
 ;;; Code:
 
 (require 'spyglass-test-helpers)
+(require 'spyglass-mirror-test)
 (require 'spyglass-transport-test)
 (require 'spyglass-bench)
 (require 'desktop)
@@ -98,6 +99,39 @@
         (set-window-configuration config)
         (delete-other-windows)
         (kill-buffer buffer)))))
+
+(ert-deftest spyglass-gui-repaint-keeps-quote-and-window-start ()
+  "A popup and repaint preserve a quote while another window follows output."
+  (let ((config (current-window-configuration))
+        (popup (generate-new-buffer " *spyglass test menu*")))
+    (unwind-protect
+        (spyglass-mirror-test-with
+         (mapconcat (lambda (n) (format "row %03d: text to quote\n" n)) (number-sequence 1 100) "")
+         (delete-other-windows)
+         (set-window-buffer (selected-window) (current-buffer))
+         (let ((reader (selected-window))
+               (follower (split-window-right)))
+           (goto-char (point-min))
+           (forward-line 30)
+           (set-window-start reader (point) t)
+           (set-mark (point))
+           (forward-line 1)
+           (setq mark-active t deactivate-mark nil)
+           (set-window-point follower (point-max))
+           (redisplay t)
+           (let ((start (window-start reader))
+                 (quote (buffer-substring-no-properties (mark) (point))))
+             (with-current-buffer popup (insert "menu\n"))
+             (display-buffer-at-bottom popup '((window-height . 4)))
+             (spyglass-mirror-test-repaint mirror (concat (buffer-string) "new output\n"))
+             (redisplay t)
+             (should (equal (buffer-substring-no-properties (mark) (point)) quote))
+             (should (= (window-start reader) start))
+             (should (= (window-point follower) (point-max)))
+             (should mark-active)
+             (should-not deactivate-mark))))
+      (set-window-configuration config)
+      (kill-buffer popup))))
 
 (ert-deftest spyglass-gui-parks-and-releases ()
   "A buffer needing a window is parked while viewers watch it and no window shows it."
