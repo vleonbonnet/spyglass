@@ -171,6 +171,12 @@ Called in the buffer with (KIND VALUE): KIND `string' and VALUE text
 to type, or KIND `key' and VALUE a key in `key-description' form,
 such as \"RET\" or \"<up>\".  See `spyglass-default-input'.")
 
+(defvar spyglass-input-connection nil
+  "The connection whose viewer typed the input being applied, or nil.
+Bound while a viewer's input is applied, around the share's input
+function (see `spyglass-input-function'), so that what the input does
+can be told to that viewer alone.")
+
 (defvar-local spyglass-submit-function nil
   "Command a viewer's RET runs in this comint buffer, or nil.
 Nil means `comint-send-input'.  A front end such as agent-shell sets
@@ -1668,7 +1674,8 @@ The timer stays armed whatever ends a poll (see `spyglass--run-repeating')."
                     (with-current-buffer (spyglass-share-buffer share)
                       ;; A viewer's input never has the owner's Emacs
                       ;; wait for its user: what would ask fails instead.
-                      (let ((inhibit-interaction t))
+                      (let ((inhibit-interaction t)
+                            (spyglass-input-connection connection))
                         (funcall (or (spyglass-share-input share)
                                      spyglass-input-function
                                      #'spyglass-default-input)

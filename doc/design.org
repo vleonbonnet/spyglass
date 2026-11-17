@@ -276,7 +276,7 @@ A mirror that closed, its connection gone for good, may be opened anew in its bu
 
 * Input
 
-The viewer sends text or keys; the owner applies them in the shared buffer through, in order, the share's =:input= function, the buffer's =spyglass-input-function= (set by adapters), or =spyglass-default-input=: in comint buffers, at the input point (below); in other buffers with a process, text and keys go to the process as a terminal sends them (=spyglass-key-bytes=); other editable buffers take text at point. A share made with =:read-only= refuses input, and says so. Input is applied with =inhibit-interaction= bound: a command that would ask the owner's user, as an interrupt asking for confirmation, fails and is reported to the viewer, never keeping the owner's Emacs waiting for someone who is not there.
+The viewer sends text or keys; the owner applies them in the shared buffer through, in order, the share's =:input= function, the buffer's =spyglass-input-function= (set by adapters), or =spyglass-default-input=: in comint buffers, at the input point (below); in other buffers with a process, text and keys go to the process as a terminal sends them (=spyglass-key-bytes=); other editable buffers take text at point. A share made with =:read-only= refuses input, and says so. Input is applied with =inhibit-interaction= bound: a command that would ask the owner's user, as an interrupt asking for confirmation, fails and is reported to the viewer, never keeping the owner's Emacs waiting for someone who is not there. =spyglass-input-connection= is bound too, to the connection the input came on: an application such as drover tells that viewer alone what the input did, as a prompt it submitted.
 
 ** Points
 

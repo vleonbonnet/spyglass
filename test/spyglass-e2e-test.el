@@ -443,6 +443,22 @@ once it loaded this spyglass."
         (should (equal (buffer-string) "aXY\nb"))
         (spyglass-test-converge (current-buffer) mirror)))))
 
+(ert-deftest spyglass-e2e-input-connection ()
+  "The input function knows the connection its viewer typed on, and only then."
+  (spyglass-test-with-connection connection
+                                 (spyglass-e2e--with-buffer "told"
+                                   (let ((typed nil))
+                                     (spyglass-share (current-buffer)
+                                                     :input (lambda (kind value)
+                                                              (push (list kind value spyglass-input-connection) typed)))
+                                     (let ((mirror (spyglass-test-mirror connection (current-buffer))))
+                                       (spyglass-mirror-send-key "RET" mirror)
+                                       (spyglass-test-wait (lambda () typed))
+                                       (pcase-let ((`((key "RET" ,told)) typed))
+                                         (should (spyglass-connection-p told))
+                                         (should (memq told (spyglass-connections))))
+                                       (should-not spyglass-input-connection))))))
+
 (ert-deftest spyglass-e2e-read-only-share ()
   "A read-only share refuses input and says so."
   (spyglass-test-with-connection connection
