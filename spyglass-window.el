@@ -67,7 +67,10 @@ and the viewers whose windows show their mirrors.  `latest': the
 party that last typed into the terminal or selected it, the owner
 winning ties; `smallest': the smallest width and the smallest height
 among all; `owner': the owner's windows while one shows the terminal,
-else as `latest'.  A share may have its own (see `spyglass-share')."
+else as `latest'.  Under `latest' and `owner', an owner whose windows
+no longer show the terminal still counts, at its current size, so that
+hiding it changes its size only for a viewer active since.  A share may
+have its own (see `spyglass-share')."
   :group 'spyglass
   :type '(choice (const :tag "Most recently active" latest)
                  (const :tag "Smallest" smallest)
@@ -340,16 +343,21 @@ TIME is when the viewer last typed into its mirror or selected it."
 (defun spyglass--choose-size (share owner-size)
   "Return the size SHARE's terminal should take, or nil for its own choice.
 OWNER-SIZE is the size the owner's windows showing the terminal give,
-or nil when none shows it.  Nil unless a viewer's window shows it."
+or nil when none shows it.  Nil unless a viewer's window shows it.
+Under `latest' and `owner', an owner showing the terminal nowhere still
+counts, with the terminal's current size: hiding the terminal resizes
+it only for a viewer active since the owner was."
   (let ((viewers (spyglass--viewer-sizes share)))
     (when viewers
-      (let ((owner (and owner-size
-                        (cons owner-size (spyglass-share-owner-active share)))))
+      (let* ((own (or owner-size
+                      (and (buffer-live-p (spyglass-share-buffer share))
+                           (spyglass--terminal-size share))))
+             (owner (and own (cons own (spyglass-share-owner-active share)))))
         (pcase (or (spyglass--share-option share :size-policy) spyglass-size-policy)
           ('smallest
-           (let ((all (mapcar #'car (if owner (cons owner viewers) viewers))))
+           (let ((all (mapcar #'car (if owner-size (cons owner viewers) viewers))))
              (cons (apply #'min (mapcar #'car all)) (apply #'min (mapcar #'cdr all)))))
-          ('owner (if owner (car owner) (spyglass--latest viewers)))
+          ('owner (or owner-size (spyglass--latest (if owner (cons owner viewers) viewers))))
           (_ (spyglass--latest (if owner (cons owner viewers) viewers))))))))
 
 (defun spyglass--process-window-size (orig process windows)

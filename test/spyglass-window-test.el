@@ -241,17 +241,35 @@ size, and `process-tty-name' is nil."
         (should (equal (spyglass--choose-size share '(120 . 50)) '(80 . 40)))
         (setf (spyglass-share-owner-active share) 25.0)
         (should (equal (spyglass--choose-size share '(120 . 50)) '(120 . 50)))
-        ;; The owner showing it nowhere does not count.
+        ;; Hidden on the owner, a terminal of unknown size takes the latest viewer's.
         (should (equal (spyglass--choose-size share nil) '(80 . 40)))
+        ;; One of known size keeps it while the owner was active last,
+        (setf (spyglass-share-grid share) '(90 . 45))
+        (should (equal (spyglass--choose-size share nil) '(90 . 45)))
+        ;; and takes a viewer's once that viewer is more recent.
+        (setf (spyglass--sub-active b) 30.0)
+        (should (equal (spyglass--choose-size share nil) '(80 . 40)))
+        (setf (spyglass--sub-active b) 20.0
+              (spyglass-share-grid share) nil)
         ;; Ties go to the owner.
         (setf (spyglass-share-owner-active share) 20.0)
         (should (equal (spyglass--choose-size share '(120 . 50)) '(120 . 50))))
       (let ((spyglass-size-policy 'smallest))
         (should (equal (spyglass--choose-size share '(120 . 35)) '(80 . 30)))
-        (should (equal (spyglass--choose-size share nil) '(80 . 30))))
+        ;; Hidden on the owner, its size does not count.
+        (setf (spyglass-share-grid share) '(90 . 25))
+        (should (equal (spyglass--choose-size share nil) '(80 . 30)))
+        (setf (spyglass-share-grid share) nil))
       (let ((spyglass-size-policy 'owner))
         (should (equal (spyglass--choose-size share '(120 . 50)) '(120 . 50)))
-        (should (equal (spyglass--choose-size share nil) '(80 . 40))))
+        (should (equal (spyglass--choose-size share nil) '(80 . 40)))
+        ;; Hidden, as under `latest': the owner wins ties.
+        (setf (spyglass-share-grid share) '(90 . 45))
+        (should (equal (spyglass--choose-size share nil) '(90 . 45)))
+        (setf (spyglass--sub-active b) 30.0)
+        (should (equal (spyglass--choose-size share nil) '(80 . 40)))
+        (setf (spyglass--sub-active b) 20.0
+              (spyglass-share-grid share) nil))
       ;; Without a viewer's window, the terminal sizes itself.
       (setf (spyglass--sub-size a) nil (spyglass--sub-size b) nil)
       (should (null (spyglass--choose-size share '(120 . 50)))))))
